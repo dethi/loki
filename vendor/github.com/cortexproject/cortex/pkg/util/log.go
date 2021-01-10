@@ -11,7 +11,8 @@ import (
 	"github.com/weaveworks/common/logging"
 	"github.com/weaveworks/common/middleware"
 	"github.com/weaveworks/common/server"
-	"github.com/weaveworks/common/user"
+
+	"github.com/cortexproject/cortex/pkg/tenant"
 )
 
 var (
@@ -39,7 +40,7 @@ func init() {
 // InitLogger initialises the global gokit logger (util.Logger) and overrides the
 // default logger for the server.
 func InitLogger(cfg *server.Config) {
-	l, err := NewPrometheusLogger(cfg.LogLevel)
+	l, err := NewPrometheusLogger(cfg.LogLevel, cfg.LogFormat)
 	if err != nil {
 		panic(err)
 	}
@@ -61,8 +62,11 @@ type PrometheusLogger struct {
 
 // NewPrometheusLogger creates a new instance of PrometheusLogger which exposes
 // Prometheus counters for various log levels.
-func NewPrometheusLogger(l logging.Level) (log.Logger, error) {
+func NewPrometheusLogger(l logging.Level, format logging.Format) (log.Logger, error) {
 	logger := log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
+	if format.String() == "json" {
+		logger = log.NewJSONLogger(log.NewSyncWriter(os.Stderr))
+	}
 	logger = level.NewFilter(logger, l.Gokit)
 
 	// Initialise counters for all supported levels:
@@ -102,7 +106,7 @@ func (pl *PrometheusLogger) Log(kv ...interface{}) error {
 func WithContext(ctx context.Context, l log.Logger) log.Logger {
 	// Weaveworks uses "orgs" and "orgID" to represent Cortex users,
 	// even though the code-base generally uses `userID` to refer to the same thing.
-	userID, err := user.ExtractOrgID(ctx)
+	userID, err := tenant.TenantID(ctx)
 	if err == nil {
 		l = WithUserID(userID, l)
 	}
@@ -127,6 +131,12 @@ func WithUserID(userID string, l log.Logger) log.Logger {
 func WithTraceID(traceID string, l log.Logger) log.Logger {
 	// See note in WithContext.
 	return log.With(l, "traceID", traceID)
+}
+
+// WithSourceIPs returns a Logger that has information about the source IPs in
+// its details.
+func WithSourceIPs(sourceIPs string, l log.Logger) log.Logger {
+	return log.With(l, "sourceIPs", sourceIPs)
 }
 
 // CheckFatal prints an error and exits with error code 1 if err is non-nil

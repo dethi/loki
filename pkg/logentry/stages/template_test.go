@@ -19,7 +19,7 @@ pipeline_stages:
 - json:
     expressions:
       app:  app
-      level: level 
+      level: level
 - template:
     source: app
     template: '{{ .Value | ToUpper }} doki'
@@ -60,17 +60,13 @@ func TestPipeline_Template(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lbls := model.LabelSet{}
 	expectedLbls := model.LabelSet{
 		"app":   "LOKI doki",
 		"level": "OK",
 		"type":  "TEST",
 	}
-	ts := time.Now()
-	entry := testTemplateLogLine
-	extracted := map[string]interface{}{}
-	pl.Process(lbls, extracted, &ts, &entry)
-	assert.Equal(t, expectedLbls, lbls)
+	out := processEntries(pl, newEntry(nil, nil, testTemplateLogLine, time.Now()))[0]
+	assert.Equal(t, expectedLbls, out.Labels)
 }
 
 func TestPipelineWithMissingKey_Template(t *testing.T) {
@@ -81,12 +77,10 @@ func TestPipelineWithMissingKey_Template(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lbls := model.LabelSet{}
 	Debug = true
-	ts := time.Now()
-	entry := testTemplateLogLineWithMissingKey
-	extracted := map[string]interface{}{}
-	pl.Process(lbls, extracted, &ts, &entry)
+
+	_ = processEntries(pl, newEntry(nil, nil, testTemplateLogLineWithMissingKey, time.Now()))
+
 	expectedLog := "level=debug msg=\"extracted template could not be converted to a string\" err=\"Can't convert <nil> to string\" type=null"
 	if !(strings.Contains(buf.String(), expectedLog)) {
 		t.Errorf("\nexpected: %s\n+actual: %s", expectedLog, buf.String())
@@ -232,6 +226,18 @@ func TestTemplateStage_Process(t *testing.T) {
 				"testval": "value",
 			},
 		},
+		"ToLowerParams": {
+			TemplateConfig{
+				Source:   "testval",
+				Template: "{{ ToLower .Value }}",
+			},
+			map[string]interface{}{
+				"testval": "Value",
+			},
+			map[string]interface{}{
+				"testval": "value",
+			},
+		},
 		"ToLowerEmptyValue": {
 			TemplateConfig{
 				Source:   "testval",
@@ -250,6 +256,54 @@ func TestTemplateStage_Process(t *testing.T) {
 			},
 			map[string]interface{}{
 				"testval": "some_silly_value_with_lots_of_spaces",
+			},
+		},
+		"regexReplaceAll": {
+			TemplateConfig{
+				Source:   "testval",
+				Template: `{{ regexReplaceAll "(Silly)" .Value "${1}foo"  }}`,
+			},
+			map[string]interface{}{
+				"testval": "Some Silly Value With Lots Of Spaces",
+			},
+			map[string]interface{}{
+				"testval": "Some Sillyfoo Value With Lots Of Spaces",
+			},
+		},
+		"regexReplaceAllerr": {
+			TemplateConfig{
+				Source:   "testval",
+				Template: `{{ regexReplaceAll "\\K" .Value "${1}foo"  }}`,
+			},
+			map[string]interface{}{
+				"testval": "Some Silly Value With Lots Of Spaces",
+			},
+			map[string]interface{}{
+				"testval": "Some Silly Value With Lots Of Spaces",
+			},
+		},
+		"regexReplaceAllLiteral": {
+			TemplateConfig{
+				Source:   "testval",
+				Template: `{{ regexReplaceAll "( |Of)" .Value "_"  }}`,
+			},
+			map[string]interface{}{
+				"testval": "Some Silly Value With Lots Of Spaces",
+			},
+			map[string]interface{}{
+				"testval": "Some_Silly_Value_With_Lots___Spaces",
+			},
+		},
+		"regexReplaceAllLiteralerr": {
+			TemplateConfig{
+				Source:   "testval",
+				Template: `{{ regexReplaceAll "\\K" .Value "err"  }}`,
+			},
+			map[string]interface{}{
+				"testval": "Some Silly Value With Lots Of Spaces",
+			},
+			map[string]interface{}{
+				"testval": "Some Silly Value With Lots Of Spaces",
 			},
 		},
 		"Trim": {
@@ -282,6 +336,30 @@ func TestTemplateStage_Process(t *testing.T) {
 			map[string]interface{}{},
 			map[string]interface{}{},
 		},
+		"Sha2Hash": {
+			TemplateConfig{
+				Source:   "testval",
+				Template: "{{ Sha2Hash .Value \"salt\" }}",
+			},
+			map[string]interface{}{
+				"testval": "this is PII data",
+			},
+			map[string]interface{}{
+				"testval": "5526fd6f8ad457279cf8ff06453c6cb61bf479fa826e3b099caa6c846f9376f2",
+			},
+		},
+		"Hash": {
+			TemplateConfig{
+				Source:   "testval",
+				Template: "{{ Hash .Value \"salt\" }}",
+			},
+			map[string]interface{}{
+				"testval": "this is PII data",
+			},
+			map[string]interface{}{
+				"testval": "0807ea24e992127128b38e4930f7155013786a4999c73a25910318a793847658",
+			},
+		},
 	}
 	for name, test := range tests {
 		test := test
@@ -291,10 +369,9 @@ func TestTemplateStage_Process(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			lbls := model.LabelSet{}
-			entry := "not important for this test"
-			st.Process(lbls, test.extracted, nil, &entry)
-			assert.Equal(t, test.expectedExtracted, test.extracted)
+
+			out := processEntries(st, newEntry(test.expectedExtracted, nil, "not important for this test", time.Time{}))[0]
+			assert.Equal(t, test.expectedExtracted, out.Extracted)
 		})
 	}
 }

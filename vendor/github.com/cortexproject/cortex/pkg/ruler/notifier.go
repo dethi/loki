@@ -3,6 +3,8 @@ package ruler
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -12,9 +14,7 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/discovery"
-	sd_config "github.com/prometheus/prometheus/discovery/config"
 	"github.com/prometheus/prometheus/discovery/dns"
-	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/notifier"
 )
 
@@ -58,9 +58,9 @@ func (rn *rulerNotifier) applyConfig(cfg *config.Config) error {
 		return err
 	}
 
-	sdCfgs := make(map[string]sd_config.ServiceDiscoveryConfig)
+	sdCfgs := make(map[string]discovery.Configs)
 	for k, v := range cfg.AlertingConfig.AlertmanagerConfigs.ToMap() {
-		sdCfgs[k] = v.ServiceDiscoveryConfig
+		sdCfgs[k] = v.ServiceDiscoveryConfigs
 	}
 	return rn.sdManager.ApplyConfig(sdCfgs)
 }
@@ -74,68 +74,94 @@ func (rn *rulerNotifier) stop() {
 // Builds a Prometheus config.Config from a ruler.Config with just the required
 // options to configure notifications to Alertmanager.
 func buildNotifierConfig(rulerConfig *Config) (*config.Config, error) {
-	if rulerConfig.AlertmanagerURL.URL == nil {
+	amURLs := strings.Split(rulerConfig.AlertmanagerURL, ",")
+	validURLs := make([]*url.URL, 0, len(amURLs))
+
+	srvDNSregexp := regexp.MustCompile(`^_.+._.+`)
+	for _, h := range amURLs {
+		url, err := url.Parse(h)
+		if err != nil {
+			return nil, err
+		}
+
+		if url.String() == "" {
+			continue
+		}
+
+		// Given we only support SRV lookups as part of service discovery, we need to ensure
+		// hosts provided follow this specification: _service._proto.name
+		// e.g. _http._tcp.alertmanager.com
+		if rulerConfig.AlertmanagerDiscovery && !srvDNSregexp.MatchString(url.Host) {
+			return nil, fmt.Errorf("when alertmanager-discovery is on, host name must be of the form _portname._tcp.service.fqdn (is %q)", url.Host)
+		}
+
+		validURLs = append(validURLs, url)
+	}
+
+	if len(validURLs) == 0 {
 		return &config.Config{}, nil
 	}
 
-	u := rulerConfig.AlertmanagerURL
-	var sdConfig sd_config.ServiceDiscoveryConfig
+	apiVersion := config.AlertmanagerAPIVersionV1
+	if rulerConfig.AlertmanangerEnableV2API {
+		apiVersion = config.AlertmanagerAPIVersionV2
+	}
+
+	amConfigs := make([]*config.AlertmanagerConfig, 0, len(validURLs))
+	for _, url := range validURLs {
+		amConfigs = append(amConfigs, amConfigFromURL(rulerConfig, url, apiVersion))
+	}
+
+	promConfig := &config.Config{
+		AlertingConfig: config.AlertingConfig{
+			AlertmanagerConfigs: amConfigs,
+		},
+	}
+
+	return promConfig, nil
+}
+
+func amConfigFromURL(rulerConfig *Config, url *url.URL, apiVersion config.AlertmanagerAPIVersion) *config.AlertmanagerConfig {
+	var sdConfig discovery.Configs
 	if rulerConfig.AlertmanagerDiscovery {
-		if !strings.Contains(u.Host, "_tcp.") {
-			return nil, fmt.Errorf("When alertmanager-discovery is on, host name must be of the form _portname._tcp.service.fqdn (is %q)", u.Host)
+		sdConfig = discovery.Configs{
+			&dns.SDConfig{
+				Names:           []string{url.Host},
+				RefreshInterval: model.Duration(rulerConfig.AlertmanagerRefreshInterval),
+				Type:            "SRV",
+				Port:            0, // Ignored, because of SRV.
+			},
 		}
-		dnsSDConfig := dns.SDConfig{
-			Names:           []string{u.Host},
-			RefreshInterval: model.Duration(rulerConfig.AlertmanagerRefreshInterval),
-			Type:            "SRV",
-			Port:            0, // Ignored, because of SRV.
-		}
-		sdConfig = sd_config.ServiceDiscoveryConfig{
-			DNSSDConfigs: []*dns.SDConfig{&dnsSDConfig},
-		}
+
 	} else {
-		sdConfig = sd_config.ServiceDiscoveryConfig{
-			StaticConfigs: []*targetgroup.Group{
+		sdConfig = discovery.Configs{
+			discovery.StaticConfig{
 				{
-					Targets: []model.LabelSet{
-						{
-							model.AddressLabel: model.LabelValue(u.Host),
-						},
-					},
+					Targets: []model.LabelSet{{model.AddressLabel: model.LabelValue(url.Host)}},
 				},
 			},
 		}
 	}
 
 	amConfig := &config.AlertmanagerConfig{
-		APIVersion:             config.AlertmanagerAPIVersionV1,
-		Scheme:                 u.Scheme,
-		PathPrefix:             u.Path,
-		Timeout:                model.Duration(rulerConfig.NotificationTimeout),
-		ServiceDiscoveryConfig: sdConfig,
+		APIVersion:              apiVersion,
+		Scheme:                  url.Scheme,
+		PathPrefix:              url.Path,
+		Timeout:                 model.Duration(rulerConfig.NotificationTimeout),
+		ServiceDiscoveryConfigs: sdConfig,
 	}
 
-	if rulerConfig.AlertmanangerEnableV2API {
-		amConfig.APIVersion = config.AlertmanagerAPIVersionV2
-	}
-
-	promConfig := &config.Config{
-		AlertingConfig: config.AlertingConfig{
-			AlertmanagerConfigs: []*config.AlertmanagerConfig{amConfig},
-		},
-	}
-
-	if u.User != nil {
+	if url.User != nil {
 		amConfig.HTTPClientConfig = config_util.HTTPClientConfig{
 			BasicAuth: &config_util.BasicAuth{
-				Username: u.User.Username(),
+				Username: url.User.Username(),
 			},
 		}
 
-		if password, isSet := u.User.Password(); isSet {
+		if password, isSet := url.User.Password(); isSet {
 			amConfig.HTTPClientConfig.BasicAuth.Password = config_util.Secret(password)
 		}
 	}
 
-	return promConfig, nil
+	return amConfig
 }

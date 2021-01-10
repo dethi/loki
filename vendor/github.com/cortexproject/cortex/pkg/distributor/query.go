@@ -3,17 +3,17 @@ package distributor
 import (
 	"context"
 	"io"
+	"time"
 
 	"github.com/opentracing/opentracing-go"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/promql"
 	"github.com/weaveworks/common/instrument"
-	"github.com/weaveworks/common/user"
 
 	"github.com/cortexproject/cortex/pkg/ingester/client"
 	ingester_client "github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/cortexproject/cortex/pkg/ring"
+	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/extract"
 	grpc_util "github.com/cortexproject/cortex/pkg/util/grpc"
@@ -23,14 +23,19 @@ import (
 func (d *Distributor) Query(ctx context.Context, from, to model.Time, matchers ...*labels.Matcher) (model.Matrix, error) {
 	var matrix model.Matrix
 	err := instrument.CollectedRequest(ctx, "Distributor.Query", queryDuration, instrument.ErrorCode, func(ctx context.Context) error {
-		replicationSet, req, err := d.queryPrep(ctx, from, to, matchers...)
+		req, err := ingester_client.ToQueryRequest(from, to, matchers)
 		if err != nil {
-			return promql.ErrStorage{Err: err}
+			return err
+		}
+
+		replicationSet, err := d.GetIngestersForQuery(ctx, matchers...)
+		if err != nil {
+			return err
 		}
 
 		matrix, err = d.queryIngesters(ctx, replicationSet, req)
 		if err != nil {
-			return promql.ErrStorage{Err: err}
+			return err
 		}
 
 		if s := opentracing.SpanFromContext(ctx); s != nil {
@@ -45,14 +50,19 @@ func (d *Distributor) Query(ctx context.Context, from, to model.Time, matchers .
 func (d *Distributor) QueryStream(ctx context.Context, from, to model.Time, matchers ...*labels.Matcher) (*ingester_client.QueryStreamResponse, error) {
 	var result *ingester_client.QueryStreamResponse
 	err := instrument.CollectedRequest(ctx, "Distributor.QueryStream", queryDuration, instrument.ErrorCode, func(ctx context.Context) error {
-		replicationSet, req, err := d.queryPrep(ctx, from, to, matchers...)
+		req, err := ingester_client.ToQueryRequest(from, to, matchers)
 		if err != nil {
-			return promql.ErrStorage{Err: err}
+			return err
+		}
+
+		replicationSet, err := d.GetIngestersForQuery(ctx, matchers...)
+		if err != nil {
+			return err
 		}
 
 		result, err = d.queryIngesterStream(ctx, replicationSet, req)
 		if err != nil {
-			return promql.ErrStorage{Err: err}
+			return err
 		}
 
 		if s := opentracing.SpanFromContext(ctx); s != nil {
@@ -63,33 +73,64 @@ func (d *Distributor) QueryStream(ctx context.Context, from, to model.Time, matc
 	return result, err
 }
 
-func (d *Distributor) queryPrep(ctx context.Context, from, to model.Time, matchers ...*labels.Matcher) (ring.ReplicationSet, *client.QueryRequest, error) {
-	var replicationSet ring.ReplicationSet
-	userID, err := user.ExtractOrgID(ctx)
+// GetIngestersForQuery returns a replication set including all ingesters that should be queried
+// to fetch series matching input label matchers.
+func (d *Distributor) GetIngestersForQuery(ctx context.Context, matchers ...*labels.Matcher) (ring.ReplicationSet, error) {
+	userID, err := tenant.TenantID(ctx)
 	if err != nil {
-		return replicationSet, nil, err
+		return ring.ReplicationSet{}, err
 	}
 
-	req, err := ingester_client.ToQueryRequest(from, to, matchers)
-	if err != nil {
-		return replicationSet, nil, err
+	// If shuffle sharding is enabled we should only query ingesters which are
+	// part of the tenant's subring.
+	if d.cfg.ShardingStrategy == util.ShardingStrategyShuffle {
+		shardSize := d.limits.IngestionTenantShardSize(userID)
+		lookbackPeriod := d.cfg.ShuffleShardingLookbackPeriod
+
+		if shardSize > 0 && lookbackPeriod > 0 {
+			return d.ingestersRing.ShuffleShardWithLookback(userID, shardSize, lookbackPeriod, time.Now()).GetReplicationSetForOperation(ring.Read)
+		}
 	}
 
-	// Get ingesters by metricName if one exists, otherwise get all ingesters
-	metricNameMatcher, _, ok := extract.MetricNameMatcherFromMatchers(matchers)
-	if !d.cfg.ShardByAllLabels && ok && metricNameMatcher.Type == labels.MatchEqual {
-		replicationSet, err = d.ingestersRing.Get(shardByMetricName(userID, metricNameMatcher.Value), ring.Read, nil)
-	} else {
-		replicationSet, err = d.ingestersRing.GetAll(ring.Read)
+	// If "shard by all labels" is disabled, we can get ingesters by metricName if exists.
+	if !d.cfg.ShardByAllLabels {
+		metricNameMatcher, _, ok := extract.MetricNameMatcherFromMatchers(matchers)
+
+		if ok && metricNameMatcher.Type == labels.MatchEqual {
+			return d.ingestersRing.Get(shardByMetricName(userID, metricNameMatcher.Value), ring.Read, nil)
+		}
 	}
-	return replicationSet, req, err
+
+	return d.ingestersRing.GetReplicationSetForOperation(ring.Read)
+}
+
+// GetIngestersForMetadata returns a replication set including all ingesters that should be queried
+// to fetch metadata (eg. label names/values or series).
+func (d *Distributor) GetIngestersForMetadata(ctx context.Context) (ring.ReplicationSet, error) {
+	userID, err := tenant.TenantID(ctx)
+	if err != nil {
+		return ring.ReplicationSet{}, err
+	}
+
+	// If shuffle sharding is enabled we should only query ingesters which are
+	// part of the tenant's subring.
+	if d.cfg.ShardingStrategy == util.ShardingStrategyShuffle {
+		shardSize := d.limits.IngestionTenantShardSize(userID)
+		lookbackPeriod := d.cfg.ShuffleShardingLookbackPeriod
+
+		if shardSize > 0 && lookbackPeriod > 0 {
+			return d.ingestersRing.ShuffleShardWithLookback(userID, shardSize, lookbackPeriod, time.Now()).GetReplicationSetForOperation(ring.Read)
+		}
+	}
+
+	return d.ingestersRing.GetReplicationSetForOperation(ring.Read)
 }
 
 // queryIngesters queries the ingesters via the older, sample-based API.
 func (d *Distributor) queryIngesters(ctx context.Context, replicationSet ring.ReplicationSet, req *client.QueryRequest) (model.Matrix, error) {
 	// Fetch samples from multiple ingesters in parallel, using the replicationSet
 	// to deal with consistency.
-	results, err := replicationSet.Do(ctx, d.cfg.ExtraQueryDelay, func(ing *ring.IngesterDesc) (interface{}, error) {
+	results, err := replicationSet.Do(ctx, d.cfg.ExtraQueryDelay, func(ctx context.Context, ing *ring.IngesterDesc) (interface{}, error) {
 		client, err := d.ingesterPool.GetClientFor(ing.Addr)
 		if err != nil {
 			return nil, err
@@ -134,7 +175,7 @@ func (d *Distributor) queryIngesters(ctx context.Context, replicationSet ring.Re
 // queryIngesterStream queries the ingesters using the new streaming API.
 func (d *Distributor) queryIngesterStream(ctx context.Context, replicationSet ring.ReplicationSet, req *client.QueryRequest) (*ingester_client.QueryStreamResponse, error) {
 	// Fetch samples from multiple ingesters
-	results, err := replicationSet.Do(ctx, d.cfg.ExtraQueryDelay, func(ing *ring.IngesterDesc) (interface{}, error) {
+	results, err := replicationSet.Do(ctx, d.cfg.ExtraQueryDelay, func(ctx context.Context, ing *ring.IngesterDesc) (interface{}, error) {
 		client, err := d.ingesterPool.GetClientFor(ing.Addr)
 		if err != nil {
 			return nil, err
@@ -171,32 +212,32 @@ func (d *Distributor) queryIngesterStream(ctx context.Context, replicationSet ri
 		return nil, err
 	}
 
-	hashToChunkseries := map[model.Fingerprint]ingester_client.TimeSeriesChunk{}
-	hashToTimeSeries := map[model.Fingerprint]ingester_client.TimeSeries{}
+	hashToChunkseries := map[string]ingester_client.TimeSeriesChunk{}
+	hashToTimeSeries := map[string]ingester_client.TimeSeries{}
 
 	for _, result := range results {
 		response := result.(*ingester_client.QueryStreamResponse)
 
 		// Parse any chunk series
 		for _, series := range response.Chunkseries {
-			hash := client.FastFingerprint(series.Labels)
-			existing := hashToChunkseries[hash]
+			key := client.LabelsToKeyString(client.FromLabelAdaptersToLabels(series.Labels))
+			existing := hashToChunkseries[key]
 			existing.Labels = series.Labels
 			existing.Chunks = append(existing.Chunks, series.Chunks...)
-			hashToChunkseries[hash] = existing
+			hashToChunkseries[key] = existing
 		}
 
 		// Parse any time series
 		for _, series := range response.Timeseries {
-			hash := client.FastFingerprint(series.Labels)
-			existing := hashToTimeSeries[hash]
+			key := client.LabelsToKeyString(client.FromLabelAdaptersToLabels(series.Labels))
+			existing := hashToTimeSeries[key]
 			existing.Labels = series.Labels
 			if existing.Samples == nil {
 				existing.Samples = series.Samples
 			} else {
 				existing.Samples = mergeSamples(existing.Samples, series.Samples)
 			}
-			hashToTimeSeries[hash] = existing
+			hashToTimeSeries[key] = existing
 		}
 	}
 

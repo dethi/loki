@@ -4,7 +4,6 @@ require "logstash/outputs/loki/entry"
 require "logstash/outputs/loki/batch"
 require "logstash/namespace"
 require 'net/http'
-require 'concurrent-edge'
 require 'time'
 require 'uri'
 require 'json'
@@ -30,6 +29,9 @@ class LogStash::Outputs::Loki < LogStash::Outputs::Base
   ## 'TLS'
   config :ca_cert, :validate => :path, :required => false
 
+  ## 'Disable server certificate verification'
+  config :insecure_skip_verify, :validate => :boolean, :default => false, :required => false
+
   ## 'Loki Tenant ID'
   config :tenant_id, :validate => :string, :required => false
 
@@ -45,8 +47,8 @@ class LogStash::Outputs::Loki < LogStash::Outputs::Base
   ## 'Backoff configuration. Initial backoff time between retries. Default 1s'
   config :min_delay, :validate => :number, :default => 1, :required => false
 
-   ## 'Backoff configuration. Maximum backoff time between retries. Default 300s'
-   config :max_delay, :validate => :number, :default => 300, :required => false
+  ## 'Backoff configuration. Maximum backoff time between retries. Default 300s'
+  config :max_delay, :validate => :number, :default => 300, :required => false
 
   ## 'Backoff configuration. Maximum number of retries to do'
   config :retries, :validate => :number, :default => 10, :required => false
@@ -65,10 +67,10 @@ class LogStash::Outputs::Loki < LogStash::Outputs::Base
 
     @logger.info("Loki output plugin", :class => self.class.name)
 
-    # initialize channels
-    @Channel = Concurrent::Channel
-    @entries = @Channel.new
-    @stop = @Channel.new
+    # initialize Queue and Mutex
+    @entries = Queue.new 
+    @mutex = Mutex.new
+    @stop = false
 
     # create nil batch object.
     @batch = nil
@@ -79,7 +81,52 @@ class LogStash::Outputs::Loki < LogStash::Outputs::Base
       validate_ssl_key
     end
 
-    @Channel.go{run()}
+    # start batch_max_wait and batch_max_size threads
+    @batch_wait_thread = Thread.new{max_batch_wait()}
+    @batch_size_thread = Thread.new{max_batch_size()}
+  end
+
+  def max_batch_size
+    loop do
+      @mutex.synchronize do
+        return if @stop
+      end
+  
+      e = @entries.deq
+      return if e.nil?
+
+      @mutex.synchronize do
+        if !add_entry_to_batch(e)
+          @logger.debug("Max batch_size is reached. Sending batch to loki")
+          send(@batch)
+          @batch = Batch.new(e)
+        end
+      end
+    end
+  end
+
+  def max_batch_wait
+    # minimum wait frequency is 10 milliseconds
+	  min_wait_checkfrequency = 1/100
+	  max_wait_checkfrequency = @batch_wait
+	  if max_wait_checkfrequency < min_wait_checkfrequency
+		  max_wait_checkfrequency = min_wait_checkfrequency
+    end
+
+    loop do
+      @mutex.synchronize do
+        return if @stop
+      end
+
+      sleep(max_wait_checkfrequency)
+      if is_batch_expired
+        @mutex.synchronize do
+          @logger.debug("Max batch_wait time is reached. Sending batch to loki")
+          send(@batch)
+          @batch = nil
+        end
+      end
+    end
   end
 
   def ssl_cert?
@@ -102,6 +149,13 @@ class LogStash::Outputs::Loki < LogStash::Outputs::Base
       use_ssl: uri.scheme == 'https'
     }
 
+     # disable server certificate verification
+    if @insecure_skip_verify
+      opts = opts.merge(
+        verify_mode: OpenSSL::SSL::VERIFY_NONE
+      )
+    end
+
     if !@cert.nil? && !@key.nil?
       opts = opts.merge(
         verify_mode: OpenSSL::SSL::VERIFY_PEER,
@@ -118,39 +172,7 @@ class LogStash::Outputs::Loki < LogStash::Outputs::Base
     opts
   end
 
-  def run()
-	  min_wait_checkfrequency = 1/100 #1 millisecond
-	  max_wait_checkfrequency = @batch_wait / 10
-	  if max_wait_checkfrequency < min_wait_checkfrequency
-		  max_wait_checkfrequency = min_wait_checkfrequency
-    end
-
-    @max_wait_check = Concurrent::Channel.tick(max_wait_checkfrequency)
-    loop do
-      Concurrent::Channel.select do |s|
-        s.take(@stop) {
-          return
-        }
-        s.take(@entries) { |e|
-         if !add_entry_to_batch(e)
-           @logger.debug("Max batch_size is reached. Sending batch to loki")
-           send(@batch)
-           @batch = Batch.new(e)
-         end
-        }
-        s.take(@max_wait_check) {
-          # Send batch if max wait time has been reached
-          if is_batch_expired
-            @logger.debug("Max batch_wait time is reached. Sending batch to loki")
-            send(@batch)
-            @batch = nil
-          end
-        }
-      end
-    end
-  end
-
-  # add an entry to the current batch return false if the batch is full
+  # Add an entry to the current batch returns false if the batch is full
   # and the entry can't be added.
   def add_entry_to_batch(e)
     line = e.entry['line']
@@ -181,8 +203,11 @@ class LogStash::Outputs::Loki < LogStash::Outputs::Base
 
   def close
     @entries.close
-    @max_wait_check.close if !@max_wait_check.nil?
-    @stop << true # stop will block until it's accepted by the worker.
+    @mutex.synchronize do 
+      @stop = true 
+    end
+    @batch_wait_thread.join
+    @batch_size_thread.join
 
     # if by any chance we still have a forming batch, we need to send it.
     send(@batch) if !@batch.nil?
@@ -222,13 +247,13 @@ class LogStash::Outputs::Loki < LogStash::Outputs::Base
       raise StandardError.new res
     rescue StandardError => e
       retry_count += 1
-      @logger.warn("Failed to send batch attempt: #{retry_count}/#{@retries}", :error_inspect => e.inspect, :error => e)
+      @logger.warn("Failed to send batch, attempt: #{retry_count}/#{@retries}", :error_inspect => e.inspect, :error => e)
       if retry_count < @retries
         sleep delay
-        if (delay * 2 - delay) > @max_delay
-          delay = delay
-        else
+        if delay * 2 <= @max_delay
           delay = delay * 2
+        else
+          delay = @max_delay
         end
         retry
       else

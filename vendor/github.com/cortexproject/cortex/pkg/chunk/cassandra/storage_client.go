@@ -34,6 +34,8 @@ type Config struct {
 	SSL                      bool                `yaml:"SSL"`
 	HostVerification         bool                `yaml:"host_verification"`
 	CAPath                   string              `yaml:"CA_path"`
+	CertPath                 string              `yaml:"tls_cert_path"`
+	KeyPath                  string              `yaml:"tls_key_path"`
 	Auth                     bool                `yaml:"auth"`
 	Username                 string              `yaml:"username"`
 	Password                 flagext.Secret      `yaml:"password"`
@@ -57,11 +59,13 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&cfg.Port, "cassandra.port", 9042, "Port that Cassandra is running on")
 	f.StringVar(&cfg.Keyspace, "cassandra.keyspace", "", "Keyspace to use in Cassandra.")
 	f.StringVar(&cfg.Consistency, "cassandra.consistency", "QUORUM", "Consistency level for Cassandra.")
-	f.IntVar(&cfg.ReplicationFactor, "cassandra.replication-factor", 1, "Replication factor to use in Cassandra.")
+	f.IntVar(&cfg.ReplicationFactor, "cassandra.replication-factor", 3, "Replication factor to use in Cassandra.")
 	f.BoolVar(&cfg.DisableInitialHostLookup, "cassandra.disable-initial-host-lookup", false, "Instruct the cassandra driver to not attempt to get host info from the system.peers table.")
 	f.BoolVar(&cfg.SSL, "cassandra.ssl", false, "Use SSL when connecting to cassandra instances.")
 	f.BoolVar(&cfg.HostVerification, "cassandra.host-verification", true, "Require SSL certificate validation.")
 	f.StringVar(&cfg.CAPath, "cassandra.ca-path", "", "Path to certificate file to verify the peer.")
+	f.StringVar(&cfg.CertPath, "cassandra.tls-cert-path", "", "Path to certificate file used by TLS.")
+	f.StringVar(&cfg.KeyPath, "cassandra.tls-key-path", "", "Path to private key file used by TLS.")
 	f.BoolVar(&cfg.Auth, "cassandra.auth", false, "Enable password authentication when connecting to cassandra.")
 	f.StringVar(&cfg.Username, "cassandra.username", "", "Username to use when connecting to cassandra.")
 	f.Var(&cfg.Password, "cassandra.password", "Password to use when connecting to cassandra.")
@@ -70,13 +74,13 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.Timeout, "cassandra.timeout", 2*time.Second, "Timeout when connecting to cassandra.")
 	f.DurationVar(&cfg.ConnectTimeout, "cassandra.connect-timeout", 5*time.Second, "Initial connection timeout, used during initial dial to server.")
 	f.DurationVar(&cfg.ReconnectInterval, "cassandra.reconnent-interval", 1*time.Second, "Interval to retry connecting to cassandra nodes marked as DOWN.")
-	f.IntVar(&cfg.Retries, "cassandra.max-retries", 0, "Number of retries to perform on a request. (Default is 0: no retries)")
-	f.DurationVar(&cfg.MinBackoff, "cassandra.retry-min-backoff", 100*time.Millisecond, "Minimum time to wait before retrying a failed request. (Default = 100ms)")
-	f.DurationVar(&cfg.MaxBackoff, "cassandra.retry-max-backoff", 10*time.Second, "Maximum time to wait before retrying a failed request. (Default = 10s)")
-	f.IntVar(&cfg.QueryConcurrency, "cassandra.query-concurrency", 0, "Limit number of concurrent queries to Cassandra. (Default is 0: no limit)")
+	f.IntVar(&cfg.Retries, "cassandra.max-retries", 0, "Number of retries to perform on a request. Set to 0 to disable retries.")
+	f.DurationVar(&cfg.MinBackoff, "cassandra.retry-min-backoff", 100*time.Millisecond, "Minimum time to wait before retrying a failed request.")
+	f.DurationVar(&cfg.MaxBackoff, "cassandra.retry-max-backoff", 10*time.Second, "Maximum time to wait before retrying a failed request.")
+	f.IntVar(&cfg.QueryConcurrency, "cassandra.query-concurrency", 0, "Limit number of concurrent queries to Cassandra. Set to 0 to disable the limit.")
 	f.IntVar(&cfg.NumConnections, "cassandra.num-connections", 2, "Number of TCP connections per host.")
 	f.BoolVar(&cfg.ConvictHosts, "cassandra.convict-hosts-on-failure", true, "Convict hosts of being down on failure.")
-	f.StringVar(&cfg.TableOptions, "cassandra.table-options", "", "Table options used to create index or chunk tables. This value is used as plain text in the table `WITH` like this, \"CREATE TABLE <generated_by_cortex> (...) WITH <cassandra.table-options>\". For details, see https://cortexmetrics.io/docs/production/cassandra. (Default = \"\": use default table options of your Cassandra)")
+	f.StringVar(&cfg.TableOptions, "cassandra.table-options", "", "Table options used to create index or chunk tables. This value is used as plain text in the table `WITH` like this, \"CREATE TABLE <generated_by_cortex> (...) WITH <cassandra.table-options>\". For details, see https://cortexmetrics.io/docs/production/cassandra. By default it will use the default table options of your Cassandra cluster.")
 }
 
 func (cfg *Config) Validate() error {
@@ -86,19 +90,19 @@ func (cfg *Config) Validate() error {
 	if cfg.SSL && cfg.HostVerification && len(strings.Split(cfg.Addresses, ",")) != 1 {
 		return errors.Errorf("Host verification is only possible for a single host.")
 	}
+	if cfg.SSL && cfg.CertPath != "" && cfg.KeyPath == "" {
+		return errors.Errorf("TLS certificate specified, but private key configuration is missing.")
+	}
+	if cfg.SSL && cfg.KeyPath != "" && cfg.CertPath == "" {
+		return errors.Errorf("TLS private key specified, but certificate configuration is missing.")
+	}
 	return nil
 }
 
-func (cfg *Config) session(name string) (*gocql.Session, error) {
-	consistency, err := gocql.ParseConsistencyWrapper(cfg.Consistency)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-
+func (cfg *Config) session(name string, reg prometheus.Registerer) (*gocql.Session, error) {
 	cluster := gocql.NewCluster(strings.Split(cfg.Addresses, ",")...)
 	cluster.Port = cfg.Port
 	cluster.Keyspace = cfg.Keyspace
-	cluster.Consistency = consistency
 	cluster.BatchObserver = observer{}
 	cluster.QueryObserver = observer{}
 	cluster.Timeout = cfg.Timeout
@@ -107,7 +111,7 @@ func (cfg *Config) session(name string) (*gocql.Session, error) {
 	cluster.NumConns = cfg.NumConnections
 	cluster.Logger = log.With(pkgutil.Logger, "module", "gocql", "client", name)
 	cluster.Registerer = prometheus.WrapRegistererWith(
-		prometheus.Labels{"client": name}, prometheus.DefaultRegisterer)
+		prometheus.Labels{"client": name}, reg)
 	if cfg.Retries > 0 {
 		cluster.RetryPolicy = &gocql.ExponentialBackoffRetryPolicy{
 			NumRetries: cfg.Retries,
@@ -118,7 +122,7 @@ func (cfg *Config) session(name string) (*gocql.Session, error) {
 	if !cfg.ConvictHosts {
 		cluster.ConvictionPolicy = noopConvictionPolicy{}
 	}
-	if err = cfg.setClusterConfig(cluster); err != nil {
+	if err := cfg.setClusterConfig(cluster); err != nil {
 		return nil, errors.WithStack(err)
 	}
 
@@ -141,20 +145,38 @@ func (cfg *Config) session(name string) (*gocql.Session, error) {
 
 // apply config settings to a cassandra ClusterConfig
 func (cfg *Config) setClusterConfig(cluster *gocql.ClusterConfig) error {
+	consistency, err := gocql.ParseConsistencyWrapper(cfg.Consistency)
+	if err != nil {
+		return errors.Wrap(err, "unable to parse the configured consistency")
+	}
+
+	cluster.Consistency = consistency
 	cluster.DisableInitialHostLookup = cfg.DisableInitialHostLookup
 
 	if cfg.SSL {
+		tlsConfig := &tls.Config{}
+
+		if cfg.CertPath != "" {
+			cert, err := tls.LoadX509KeyPair(cfg.CertPath, cfg.KeyPath)
+			if err != nil {
+				return errors.Wrap(err, "Unable to load TLS certificate and private key")
+			}
+
+			tlsConfig.Certificates = []tls.Certificate{cert}
+		}
+
 		if cfg.HostVerification {
+			tlsConfig.ServerName = strings.Split(cfg.Addresses, ",")[0]
+
 			cluster.SslOpts = &gocql.SslOptions{
 				CaPath:                 cfg.CAPath,
 				EnableHostVerification: true,
-				Config: &tls.Config{
-					ServerName: strings.Split(cfg.Addresses, ",")[0],
-				},
+				Config:                 tlsConfig,
 			}
 		} else {
 			cluster.SslOpts = &gocql.SslOptions{
 				EnableHostVerification: false,
+				Config:                 tlsConfig,
 			}
 		}
 	}
@@ -222,15 +244,13 @@ type StorageClient struct {
 }
 
 // NewStorageClient returns a new StorageClient.
-func NewStorageClient(cfg Config, schemaCfg chunk.SchemaConfig) (*StorageClient, error) {
-	pkgutil.WarnExperimentalUse("Cassandra Backend")
-
-	readSession, err := cfg.session("index-read")
+func NewStorageClient(cfg Config, schemaCfg chunk.SchemaConfig, registerer prometheus.Registerer) (*StorageClient, error) {
+	readSession, err := cfg.session("index-read", registerer)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 
-	writeSession, err := cfg.session("index-write")
+	writeSession, err := cfg.session("index-write", registerer)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -407,15 +427,13 @@ type ObjectClient struct {
 }
 
 // NewObjectClient returns a new ObjectClient.
-func NewObjectClient(cfg Config, schemaCfg chunk.SchemaConfig) (*ObjectClient, error) {
-	pkgutil.WarnExperimentalUse("Cassandra Backend")
-
-	readSession, err := cfg.session("chunks-read")
+func NewObjectClient(cfg Config, schemaCfg chunk.SchemaConfig, registerer prometheus.Registerer) (*ObjectClient, error) {
+	readSession, err := cfg.session("chunks-read", registerer)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 
-	writeSession, err := cfg.session("chunks-write")
+	writeSession, err := cfg.session("chunks-write", registerer)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}

@@ -20,9 +20,9 @@ import (
 	amconfig "github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/weaveworks/common/user"
 
 	"github.com/cortexproject/cortex/pkg/alertmanager/alerts"
+	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 	"github.com/cortexproject/cortex/pkg/util/services"
@@ -38,9 +38,6 @@ const (
 	// If a config sets the webhook URL to this, it will be rewritten to
 	// a URL derived from Config.AutoWebhookRoot
 	autoWebhookURL = "http://internal.monitor"
-
-	configStatusValid   = "valid"
-	configStatusInvalid = "invalid"
 
 	statusPage = `
 <!doctype html>
@@ -128,20 +125,33 @@ func (cfg *MultitenantAlertmanagerConfig) RegisterFlags(f *flag.FlagSet) {
 	cfg.Store.RegisterFlags(f)
 }
 
+// Validate config and returns error on failure
+func (cfg *MultitenantAlertmanagerConfig) Validate() error {
+	if err := cfg.Store.Validate(); err != nil {
+		return errors.Wrap(err, "invalid storage config")
+	}
+	return nil
+}
+
 type multitenantAlertmanagerMetrics struct {
-	totalConfigs *prometheus.GaugeVec
+	lastReloadSuccessful          *prometheus.GaugeVec
+	lastReloadSuccessfulTimestamp *prometheus.GaugeVec
 }
 
 func newMultitenantAlertmanagerMetrics(reg prometheus.Registerer) *multitenantAlertmanagerMetrics {
 	m := &multitenantAlertmanagerMetrics{}
 
-	m.totalConfigs = promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
+	m.lastReloadSuccessful = promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "cortex",
-		Name:      "alertmanager_configs",
-		Help:      "How many configs the multitenant alertmanager knows about.",
-	}, []string{"status"})
-	m.totalConfigs.WithLabelValues(configStatusInvalid).Set(0)
-	m.totalConfigs.WithLabelValues(configStatusValid).Set(0)
+		Name:      "alertmanager_config_last_reload_successful",
+		Help:      "Boolean set to 1 whenever the last configuration reload attempt was successful.",
+	}, []string{"user"})
+
+	m.lastReloadSuccessfulTimestamp = promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "cortex",
+		Name:      "alertmanager_config_last_reload_successful_seconds",
+		Help:      "Timestamp of the last successful configuration reload.",
+	}, []string{"user"})
 
 	return m
 }
@@ -178,6 +188,10 @@ func NewMultitenantAlertmanager(cfg *MultitenantAlertmanagerConfig, logger log.L
 	err := os.MkdirAll(cfg.DataDir, 0777)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create Alertmanager data directory %q: %s", cfg.DataDir, err)
+	}
+
+	if cfg.ExternalURL.URL == nil {
+		return nil, fmt.Errorf("unable to create Alertmanager because the external URL has not been configured")
 	}
 
 	var fallbackConfig []byte
@@ -311,15 +325,17 @@ func (am *MultitenantAlertmanager) poll() (map[string]alerts.AlertConfigDesc, er
 }
 
 func (am *MultitenantAlertmanager) syncConfigs(cfgs map[string]alerts.AlertConfigDesc) {
-	invalid := 0 // Count the number of invalid configs as we go.
-
 	level.Debug(am.logger).Log("msg", "adding configurations", "num_configs", len(cfgs))
-	for _, cfg := range cfgs {
+	for user, cfg := range cfgs {
 		err := am.setConfig(cfg)
 		if err != nil {
-			invalid++
+			am.multitenantMetrics.lastReloadSuccessful.WithLabelValues(user).Set(float64(0))
 			level.Warn(am.logger).Log("msg", "error applying config", "err", err)
+			continue
 		}
+
+		am.multitenantMetrics.lastReloadSuccessful.WithLabelValues(user).Set(float64(1))
+		am.multitenantMetrics.lastReloadSuccessfulTimestamp.WithLabelValues(user).SetToCurrentTime()
 	}
 
 	am.alertmanagersMtx.Lock()
@@ -332,52 +348,11 @@ func (am *MultitenantAlertmanager) syncConfigs(cfgs map[string]alerts.AlertConfi
 			level.Info(am.logger).Log("msg", "deactivating per-tenant alertmanager", "user", user)
 			userAM.Pause()
 			delete(am.cfgs, user)
+			am.multitenantMetrics.lastReloadSuccessful.DeleteLabelValues(user)
+			am.multitenantMetrics.lastReloadSuccessfulTimestamp.DeleteLabelValues(user)
 			level.Info(am.logger).Log("msg", "deactivated per-tenant alertmanager", "user", user)
 		}
 	}
-	am.multitenantMetrics.totalConfigs.WithLabelValues(configStatusInvalid).Set(float64(invalid))
-	am.multitenantMetrics.totalConfigs.WithLabelValues(configStatusValid).Set(float64(len(am.cfgs) - invalid))
-}
-
-func (am *MultitenantAlertmanager) transformConfig(userID string, amConfig *amconfig.Config) (*amconfig.Config, error) {
-	if amConfig == nil { // shouldn't happen, but check just in case
-		return nil, fmt.Errorf("no usable Cortex configuration for %v", userID)
-	}
-	if am.cfg.AutoWebhookRoot != "" {
-		for _, r := range amConfig.Receivers {
-			for _, w := range r.WebhookConfigs {
-				if w.URL.String() == autoWebhookURL {
-					u, err := url.Parse(am.cfg.AutoWebhookRoot + "/" + userID + "/monitor")
-					if err != nil {
-						return nil, err
-					}
-					w.URL = &amconfig.URL{URL: u}
-				}
-			}
-		}
-	}
-
-	return amConfig, nil
-}
-
-func (am *MultitenantAlertmanager) createTemplatesFile(userID, fn, content string) (bool, error) {
-	dir := filepath.Join(am.cfg.DataDir, "templates", userID, filepath.Dir(fn))
-	err := os.MkdirAll(dir, 0755)
-	if err != nil {
-		return false, fmt.Errorf("unable to create Alertmanager templates directory %q: %s", dir, err)
-	}
-
-	file := filepath.Join(dir, fn)
-	// Check if the template file already exists and if it has changed
-	if tmpl, err := ioutil.ReadFile(file); err == nil && string(tmpl) == content {
-		return false, nil
-	}
-
-	if err := ioutil.WriteFile(file, []byte(content), 0644); err != nil {
-		return false, fmt.Errorf("unable to create Alertmanager template file %q: %s", file, err)
-	}
-
-	return true, nil
 }
 
 // setConfig applies the given configuration to the alertmanager for `userID`,
@@ -391,7 +366,7 @@ func (am *MultitenantAlertmanager) setConfig(cfg alerts.AlertConfigDesc) error {
 	var hasTemplateChanges bool
 
 	for _, tmpl := range cfg.Templates {
-		hasChanged, err := am.createTemplatesFile(cfg.User, tmpl.Filename, tmpl.Body)
+		hasChanged, err := createTemplateFile(am.cfg.DataDir, cfg.User, tmpl.Filename, tmpl.Body)
 		if err != nil {
 			return err
 		}
@@ -403,35 +378,55 @@ func (am *MultitenantAlertmanager) setConfig(cfg alerts.AlertConfigDesc) error {
 
 	level.Debug(am.logger).Log("msg", "setting config", "user", cfg.User)
 
+	rawCfg := cfg.RawConfig
 	if cfg.RawConfig == "" {
 		if am.fallbackConfig == "" {
 			return fmt.Errorf("blank Alertmanager configuration for %v", cfg.User)
 		}
-		level.Info(am.logger).Log("msg", "blank Alertmanager configuration; using fallback", "user_id", cfg.User)
+		level.Debug(am.logger).Log("msg", "blank Alertmanager configuration; using fallback", "user", cfg.User)
 		userAmConfig, err = amconfig.Load(am.fallbackConfig)
 		if err != nil {
 			return fmt.Errorf("unable to load fallback configuration for %v: %v", cfg.User, err)
 		}
+		rawCfg = am.fallbackConfig
 	} else {
 		userAmConfig, err = amconfig.Load(cfg.RawConfig)
 		if err != nil && hasExisting {
-			// XXX: This means that if a user has a working configuration and
-			// they submit a broken one, we'll keep processing the last known
-			// working configuration, and they'll never know.
-			// TODO: Provide a way of communicating this to the user and for removing
-			// Alertmanager instances.
+			// This means that if a user has a working config and
+			// they submit a broken one, the Manager will keep running the last known
+			// working configuration.
 			return fmt.Errorf("invalid Cortex configuration for %v: %v", cfg.User, err)
 		}
 	}
 
-	if userAmConfig, err = am.transformConfig(cfg.User, userAmConfig); err != nil {
-		return err
+	// We can have an empty configuration here if:
+	// 1) the user had a previous alertmanager
+	// 2) then, submitted a non-working configuration (and we kept running the prev working config)
+	// 3) finally, the cortex AM instance is restarted and the running version is no longer present
+	if userAmConfig == nil {
+		return fmt.Errorf("no usable Alertmanager configuration for %v", cfg.User)
+	}
+
+	// Transform webhook configs URLs to the per tenant monitor
+	if am.cfg.AutoWebhookRoot != "" {
+		for i, r := range userAmConfig.Receivers {
+			for j, w := range r.WebhookConfigs {
+				if w.URL.String() == autoWebhookURL {
+					u, err := url.Parse(am.cfg.AutoWebhookRoot + "/" + cfg.User + "/monitor")
+					if err != nil {
+						return err
+					}
+
+					userAmConfig.Receivers[i].WebhookConfigs[j].URL = &amconfig.URL{URL: u}
+				}
+			}
+		}
 	}
 
 	// If no Alertmanager instance exists for this user yet, start one.
 	if !hasExisting {
 		level.Debug(am.logger).Log("msg", "initializing new per-tenant alertmanager", "user", cfg.User)
-		newAM, err := am.newAlertmanager(cfg.User, userAmConfig)
+		newAM, err := am.newAlertmanager(cfg.User, userAmConfig, rawCfg)
 		if err != nil {
 			return err
 		}
@@ -441,7 +436,7 @@ func (am *MultitenantAlertmanager) setConfig(cfg alerts.AlertConfigDesc) error {
 	} else if am.cfgs[cfg.User].RawConfig != cfg.RawConfig || hasTemplateChanges {
 		level.Info(am.logger).Log("msg", "updating new per-tenant alertmanager", "user", cfg.User)
 		// If the config changed, apply the new one.
-		err := existing.ApplyConfig(cfg.User, userAmConfig)
+		err := existing.ApplyConfig(cfg.User, userAmConfig, rawCfg)
 		if err != nil {
 			return fmt.Errorf("unable to apply Alertmanager config for user %v: %v", cfg.User, err)
 		}
@@ -450,7 +445,7 @@ func (am *MultitenantAlertmanager) setConfig(cfg alerts.AlertConfigDesc) error {
 	return nil
 }
 
-func (am *MultitenantAlertmanager) newAlertmanager(userID string, amConfig *amconfig.Config) (*Alertmanager, error) {
+func (am *MultitenantAlertmanager) newAlertmanager(userID string, amConfig *amconfig.Config, rawCfg string) (*Alertmanager, error) {
 	reg := prometheus.NewRegistry()
 	newAM, err := New(&Config{
 		UserID:      userID,
@@ -465,7 +460,7 @@ func (am *MultitenantAlertmanager) newAlertmanager(userID string, amConfig *amco
 		return nil, fmt.Errorf("unable to start Alertmanager for user %v: %v", userID, err)
 	}
 
-	if err := newAM.ApplyConfig(userID, amConfig); err != nil {
+	if err := newAM.ApplyConfig(userID, amConfig, rawCfg); err != nil {
 		return nil, fmt.Errorf("unable to apply initial config for user %v: %v", userID, err)
 	}
 
@@ -475,7 +470,7 @@ func (am *MultitenantAlertmanager) newAlertmanager(userID string, amConfig *amco
 
 // ServeHTTP serves the Alertmanager's web UI and API.
 func (am *MultitenantAlertmanager) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	userID, _, err := user.ExtractOrgIDFromHTTPRequest(req)
+	userID, err := tenant.TenantID(req.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -484,11 +479,50 @@ func (am *MultitenantAlertmanager) ServeHTTP(w http.ResponseWriter, req *http.Re
 	userAM, ok := am.alertmanagers[userID]
 	am.alertmanagersMtx.Unlock()
 
-	if !ok || !userAM.IsActive() {
-		http.Error(w, "no Alertmanager for this user ID", http.StatusNotFound)
+	if ok {
+		if !userAM.IsActive() {
+			level.Debug(am.logger).Log("msg", "the Alertmanager is not active", "user", userID)
+			http.Error(w, "the Alertmanager is not configured", http.StatusNotFound)
+			return
+		}
+
+		userAM.mux.ServeHTTP(w, req)
 		return
 	}
-	userAM.mux.ServeHTTP(w, req)
+
+	if am.fallbackConfig != "" {
+		userAM, err = am.alertmanagerFromFallbackConfig(userID)
+		if err != nil {
+			level.Error(am.logger).Log("msg", "unable to initialize the Alertmanager with a fallback configuration", "user", userID, "err", err)
+			http.Error(w, "Failed to initialize the Alertmanager", http.StatusInternalServerError)
+			return
+		}
+
+		userAM.mux.ServeHTTP(w, req)
+		return
+	}
+
+	level.Debug(am.logger).Log("msg", "the Alertmanager has no configuration and no fallback specified", "user", userID)
+	http.Error(w, "the Alertmanager is not configured", http.StatusNotFound)
+}
+
+func (am *MultitenantAlertmanager) alertmanagerFromFallbackConfig(userID string) (*Alertmanager, error) {
+	// Upload an empty config so that the Alertmanager is no de-activated in the next poll
+	cfgDesc := alerts.ToProto("", nil, userID)
+	err := am.store.SetAlertConfig(context.Background(), cfgDesc)
+	if err != nil {
+		return nil, err
+	}
+
+	// Calling setConfig with an empty configuration will use the fallback config.
+	err = am.setConfig(cfgDesc)
+	if err != nil {
+		return nil, err
+	}
+
+	am.alertmanagersMtx.Lock()
+	defer am.alertmanagersMtx.Unlock()
+	return am.alertmanagers[userID], nil
 }
 
 // GetStatusHandler returns the status handler for this multi-tenant
@@ -510,4 +544,28 @@ func (s StatusHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
+}
+
+func createTemplateFile(dataDir, userID, fn, content string) (bool, error) {
+	if fn != filepath.Base(fn) {
+		return false, fmt.Errorf("template file name '%s' is not not valid", fn)
+	}
+
+	dir := filepath.Join(dataDir, "templates", userID, filepath.Dir(fn))
+	err := os.MkdirAll(dir, 0755)
+	if err != nil {
+		return false, fmt.Errorf("unable to create Alertmanager templates directory %q: %s", dir, err)
+	}
+
+	file := filepath.Join(dir, fn)
+	// Check if the template file already exists and if it has changed
+	if tmpl, err := ioutil.ReadFile(file); err == nil && string(tmpl) == content {
+		return false, nil
+	}
+
+	if err := ioutil.WriteFile(file, []byte(content), 0644); err != nil {
+		return false, fmt.Errorf("unable to create Alertmanager template file %q: %s", file, err)
+	}
+
+	return true, nil
 }

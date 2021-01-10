@@ -83,8 +83,9 @@ type Shipper struct {
 	allowOutOfOrderUploads bool
 }
 
-// New creates a new shipper that detects new TSDB blocks in dir and uploads them
-// to remote if necessary. It attaches the Thanos metadata section in each meta JSON file.
+// New creates a new shipper that detects new TSDB blocks in dir and uploads them to
+// remote if necessary. It attaches the Thanos metadata section in each meta JSON file.
+// If uploadCompacted is enabled, it also uploads compacted blocks which are already in filesystem.
 func New(
 	logger log.Logger,
 	r prometheus.Registerer,
@@ -92,6 +93,7 @@ func New(
 	bucket objstore.Bucket,
 	lbls func() labels.Labels,
 	source metadata.SourceType,
+	uploadCompacted bool,
 	allowOutOfOrderUploads bool,
 ) *Shipper {
 	if logger == nil {
@@ -106,40 +108,10 @@ func New(
 		dir:                    dir,
 		bucket:                 bucket,
 		labels:                 lbls,
-		metrics:                newMetrics(r, false),
+		metrics:                newMetrics(r, uploadCompacted),
 		source:                 source,
 		allowOutOfOrderUploads: allowOutOfOrderUploads,
-	}
-}
-
-// NewWithCompacted creates a new shipper that detects new TSDB blocks in dir and uploads them
-// to remote if necessary, including compacted blocks which are already in filesystem.
-// It attaches the Thanos metadata section in each meta JSON file.
-func NewWithCompacted(
-	logger log.Logger,
-	r prometheus.Registerer,
-	dir string,
-	bucket objstore.Bucket,
-	lbls func() labels.Labels,
-	source metadata.SourceType,
-	allowOutOfOrderUploads bool,
-) *Shipper {
-	if logger == nil {
-		logger = log.NewNopLogger()
-	}
-	if lbls == nil {
-		lbls = func() labels.Labels { return nil }
-	}
-
-	return &Shipper{
-		logger:                 logger,
-		dir:                    dir,
-		bucket:                 bucket,
-		labels:                 lbls,
-		metrics:                newMetrics(r, true),
-		source:                 source,
-		uploadCompacted:        true,
-		allowOutOfOrderUploads: allowOutOfOrderUploads,
+		uploadCompacted:        uploadCompacted,
 	}
 }
 
@@ -310,6 +282,7 @@ func (s *Shipper) Sync(ctx context.Context) (uploaded int, err error) {
 			return 0, errors.Wrap(err, "check exists")
 		}
 		if ok {
+			meta.Uploaded = append(meta.Uploaded, m.ULID)
 			continue
 		}
 
@@ -386,7 +359,8 @@ func (s *Shipper) upload(ctx context.Context, meta *metadata.Meta) error {
 		meta.Thanos.Labels = lset.Map()
 	}
 	meta.Thanos.Source = s.source
-	if err := metadata.Write(s.logger, updir, meta); err != nil {
+	meta.Thanos.SegmentFiles = block.GetSegmentFiles(updir)
+	if err := meta.WriteToDir(s.logger, updir); err != nil {
 		return errors.Wrap(err, "write meta file")
 	}
 	return block.Upload(ctx, s.logger, s.bucket, updir)
@@ -416,7 +390,7 @@ func (s *Shipper) blockMetasFromOldest() (metas []*metadata.Meta, _ error) {
 		if !fi.IsDir() {
 			continue
 		}
-		m, err := metadata.Read(dir)
+		m, err := metadata.ReadFromDir(dir)
 		if err != nil {
 			return nil, errors.Wrapf(err, "read metadata for block %v", dir)
 		}

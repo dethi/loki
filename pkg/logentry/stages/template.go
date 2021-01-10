@@ -2,8 +2,11 @@ package stages
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"reflect"
+	"regexp"
 	"strings"
 	"text/template"
 	"time"
@@ -12,6 +15,8 @@ import (
 	"github.com/go-kit/kit/log/level"
 	"github.com/mitchellh/mapstructure"
 	"github.com/prometheus/common/model"
+
+	"golang.org/x/crypto/sha3"
 )
 
 // Config Errors
@@ -31,6 +36,22 @@ var (
 		"TrimPrefix": strings.TrimPrefix,
 		"TrimSuffix": strings.TrimSuffix,
 		"TrimSpace":  strings.TrimSpace,
+		"Hash": func(salt string, input string) string {
+			hash := sha3.Sum256([]byte(salt + input))
+			return hex.EncodeToString(hash[:])
+		},
+		"Sha2Hash": func(salt string, input string) string {
+			hash := sha256.Sum256([]byte(salt + input))
+			return hex.EncodeToString(hash[:])
+		},
+		"regexReplaceAll": func(regex string, s string, repl string) string {
+			r := regexp.MustCompile(regex)
+			return r.ReplaceAllString(s, repl)
+		},
+		"regexReplaceAllLiteral": func(regex string, s string, repl string) string {
+			r := regexp.MustCompile(regex)
+			return r.ReplaceAllLiteralString(s, repl)
+		},
 	}
 )
 
@@ -53,7 +74,7 @@ func validateTemplateConfig(cfg *TemplateConfig) (*template.Template, error) {
 }
 
 // newTemplateStage creates a new templateStage
-func newTemplateStage(logger log.Logger, config interface{}) (*templateStage, error) {
+func newTemplateStage(logger log.Logger, config interface{}) (Stage, error) {
 	cfg := &TemplateConfig{}
 	err := mapstructure.Decode(config, cfg)
 	if err != nil {
@@ -64,11 +85,11 @@ func newTemplateStage(logger log.Logger, config interface{}) (*templateStage, er
 		return nil, err
 	}
 
-	return &templateStage{
+	return toStage(&templateStage{
 		cfgs:     cfg,
 		logger:   logger,
 		template: t,
-	}, nil
+	}), nil
 }
 
 // templateStage will mutate the incoming entry and set it from extracted data

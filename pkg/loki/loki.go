@@ -7,14 +7,21 @@ import (
 	"fmt"
 	"net/http"
 
+	frontend "github.com/cortexproject/cortex/pkg/frontend/v1"
+	"github.com/cortexproject/cortex/pkg/querier/worker"
+
+	"github.com/grafana/loki/pkg/storage/stores/shipper/compactor"
+
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 	"github.com/cortexproject/cortex/pkg/util/modules"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/weaveworks/common/signals"
 
 	"github.com/cortexproject/cortex/pkg/chunk"
-	"github.com/cortexproject/cortex/pkg/querier/frontend"
 	"github.com/cortexproject/cortex/pkg/ring"
 	"github.com/cortexproject/cortex/pkg/ring/kv/memberlist"
+	cortex_ruler "github.com/cortexproject/cortex/pkg/ruler"
+	"github.com/cortexproject/cortex/pkg/ruler/rules"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/runtimeconfig"
 	"github.com/cortexproject/cortex/pkg/util/services"
@@ -29,8 +36,10 @@ import (
 	"github.com/grafana/loki/pkg/distributor"
 	"github.com/grafana/loki/pkg/ingester"
 	"github.com/grafana/loki/pkg/ingester/client"
+	"github.com/grafana/loki/pkg/lokifrontend"
 	"github.com/grafana/loki/pkg/querier"
 	"github.com/grafana/loki/pkg/querier/queryrange"
+	"github.com/grafana/loki/pkg/ruler"
 	"github.com/grafana/loki/pkg/storage"
 	"github.com/grafana/loki/pkg/tracing"
 	serverutil "github.com/grafana/loki/pkg/util/server"
@@ -50,15 +59,17 @@ type Config struct {
 	Ingester         ingester.Config             `yaml:"ingester,omitempty"`
 	StorageConfig    storage.Config              `yaml:"storage_config,omitempty"`
 	ChunkStoreConfig chunk.StoreConfig           `yaml:"chunk_store_config,omitempty"`
-	SchemaConfig     chunk.SchemaConfig          `yaml:"schema_config,omitempty"`
+	SchemaConfig     storage.SchemaConfig        `yaml:"schema_config,omitempty"`
 	LimitsConfig     validation.Limits           `yaml:"limits_config,omitempty"`
 	TableManager     chunk.TableManagerConfig    `yaml:"table_manager,omitempty"`
-	Worker           frontend.WorkerConfig       `yaml:"frontend_worker,omitempty"`
-	Frontend         frontend.Config             `yaml:"frontend,omitempty"`
+	Worker           worker.Config               `yaml:"frontend_worker,omitempty"`
+	Frontend         lokifrontend.Config         `yaml:"frontend,omitempty"`
+	Ruler            ruler.Config                `yaml:"ruler,omitempty"`
 	QueryRange       queryrange.Config           `yaml:"query_range,omitempty"`
 	RuntimeConfig    runtimeconfig.ManagerConfig `yaml:"runtime_config,omitempty"`
 	MemberlistKV     memberlist.KVConfig         `yaml:"memberlist"`
 	Tracing          tracing.Config              `yaml:"tracing"`
+	CompactorConfig  compactor.Config            `yaml:"compactor,omitempty"`
 }
 
 // RegisterFlags registers flag.
@@ -80,11 +91,21 @@ func (c *Config) RegisterFlags(f *flag.FlagSet) {
 	c.LimitsConfig.RegisterFlags(f)
 	c.TableManager.RegisterFlags(f)
 	c.Frontend.RegisterFlags(f)
+	c.Ruler.RegisterFlags(f)
 	c.Worker.RegisterFlags(f)
 	c.QueryRange.RegisterFlags(f)
 	c.RuntimeConfig.RegisterFlags(f)
 	c.MemberlistKV.RegisterFlags(f, "")
 	c.Tracing.RegisterFlags(f)
+	c.CompactorConfig.RegisterFlags(f)
+}
+
+// Clone takes advantage of pass-by-value semantics to return a distinct *Config.
+// This is primarily used to parse a different flag set without mutating the original *Config.
+func (c *Config) Clone() flagext.Registerer {
+	return func(c Config) *Config {
+		return &c
+	}(*c)
 }
 
 // Validate the config and returns an error if the validation
@@ -102,6 +123,12 @@ func (c *Config) Validate(log log.Logger) error {
 	if err := c.TableManager.Validate(); err != nil {
 		return errors.Wrap(err, "invalid tablemanager config")
 	}
+	if err := c.Ruler.Validate(); err != nil {
+		return errors.Wrap(err, "invalid ruler config")
+	}
+	if err := c.Ingester.Validate(); err != nil {
+		return errors.Wrap(err, "invalid ingester config")
+	}
 	return nil
 }
 
@@ -110,21 +137,26 @@ type Loki struct {
 	cfg Config
 
 	// set during initialization
-	moduleManager *modules.Manager
+	ModuleManager *modules.Manager
 	serviceMap    map[string]services.Service
 
-	server        *server.Server
-	ring          *ring.Ring
-	overrides     *validation.Overrides
-	distributor   *distributor.Distributor
-	ingester      *ingester.Ingester
-	querier       *querier.Querier
-	store         storage.Store
-	tableManager  *chunk.TableManager
-	frontend      *frontend.Frontend
-	stopper       queryrange.Stopper
-	runtimeConfig *runtimeconfig.Manager
-	memberlistKV  *memberlist.KVInitService
+	Server          *server.Server
+	ring            *ring.Ring
+	overrides       *validation.Overrides
+	distributor     *distributor.Distributor
+	ingester        *ingester.Ingester
+	querier         *querier.Querier
+	ingesterQuerier *querier.IngesterQuerier
+	store           storage.Store
+	tableManager    *chunk.TableManager
+	frontend        *frontend.Frontend
+	ruler           *cortex_ruler.Ruler
+	RulerStorage    rules.RuleStore
+	rulerAPI        *cortex_ruler.API
+	stopper         queryrange.Stopper
+	runtimeConfig   *runtimeconfig.Manager
+	memberlistKV    *memberlist.KVInitService
+	compactor       *compactor.Compactor
 
 	httpAuthMiddleware middleware.Interface
 }
@@ -139,7 +171,7 @@ func New(cfg Config) (*Loki, error) {
 	if err := loki.setupModuleManager(); err != nil {
 		return nil, err
 	}
-	storage.RegisterCustomIndexClients(cfg.StorageConfig, prometheus.DefaultRegisterer)
+	storage.RegisterCustomIndexClients(&loki.cfg.StorageConfig, prometheus.DefaultRegisterer)
 
 	return loki, nil
 }
@@ -174,13 +206,13 @@ var GRPCStreamAuthInterceptor = func(srv interface{}, ss grpc.ServerStream, info
 
 // Run starts Loki running, and blocks until a Loki stops.
 func (t *Loki) Run() error {
-	serviceMap, err := t.moduleManager.InitModuleServices(t.cfg.Target)
+	serviceMap, err := t.ModuleManager.InitModuleServices(t.cfg.Target)
 	if err != nil {
 		return err
 	}
 
 	t.serviceMap = serviceMap
-	t.server.HTTP.Handle("/services", http.HandlerFunc(t.servicesHandler))
+	t.Server.HTTP.Handle("/services", http.HandlerFunc(t.servicesHandler))
 
 	// get all services, create service manager and tell it to start
 	var servs []services.Service
@@ -194,7 +226,7 @@ func (t *Loki) Run() error {
 	}
 
 	// before starting servers, register /ready handler. It should reflect entire Loki.
-	t.server.HTTP.Path("/ready").Handler(t.readyHandler(sm))
+	t.Server.HTTP.Path("/ready").Handler(t.readyHandler(sm))
 
 	// Let's listen for events from this manager, and log them.
 	healthy := func() { level.Info(util.Logger).Log("msg", "Loki started") }
@@ -221,7 +253,7 @@ func (t *Loki) Run() error {
 	sm.AddListener(services.NewManagerListener(healthy, stopped, serviceFailed))
 
 	// Setup signal handler. If signal arrives, we stop the manager, which stops all the services.
-	handler := signals.NewHandler(t.server.Log)
+	handler := signals.NewHandler(t.Server.Log)
 	go func() {
 		handler.Loop()
 		sm.StopAsync()
@@ -277,6 +309,15 @@ func (t *Loki) readyHandler(sm *services.Manager) http.HandlerFunc {
 			}
 		}
 
+		// Query Frontend has a special check that makes sure that a querier is attached before it signals
+		// itself as ready
+		if t.frontend != nil {
+			if err := t.frontend.CheckReady(r.Context()); err != nil {
+				http.Error(w, "Query Frontend not ready: "+err.Error(), http.StatusServiceUnavailable)
+				return
+			}
+		}
+
 		http.Error(w, "ready", http.StatusOK)
 	}
 }
@@ -293,21 +334,39 @@ func (t *Loki) setupModuleManager() error {
 	mm.RegisterModule(Store, t.initStore)
 	mm.RegisterModule(Ingester, t.initIngester)
 	mm.RegisterModule(Querier, t.initQuerier)
+	mm.RegisterModule(IngesterQuerier, t.initIngesterQuerier)
 	mm.RegisterModule(QueryFrontend, t.initQueryFrontend)
+	mm.RegisterModule(RulerStorage, t.initRulerStorage, modules.UserInvisibleModule)
+	mm.RegisterModule(Ruler, t.initRuler)
 	mm.RegisterModule(TableManager, t.initTableManager)
+	mm.RegisterModule(Compactor, t.initCompactor)
 	mm.RegisterModule(All, nil)
 
 	// Add dependencies
 	deps := map[string][]string{
-		Ring:          {RuntimeConfig, Server, MemberlistKV},
-		Overrides:     {RuntimeConfig},
-		Distributor:   {Ring, Server, Overrides},
-		Store:         {Overrides},
-		Ingester:      {Store, Server, MemberlistKV},
-		Querier:       {Store, Ring, Server},
-		QueryFrontend: {Server, Overrides},
-		TableManager:  {Server},
-		All:           {Querier, Ingester, Distributor, TableManager},
+		Ring:            {RuntimeConfig, Server, MemberlistKV},
+		Overrides:       {RuntimeConfig},
+		Distributor:     {Ring, Server, Overrides},
+		Store:           {Overrides},
+		Ingester:        {Store, Server, MemberlistKV},
+		Querier:         {Store, Ring, Server, IngesterQuerier},
+		QueryFrontend:   {Server, Overrides},
+		Ruler:           {Ring, Server, Store, RulerStorage, IngesterQuerier},
+		TableManager:    {Server},
+		Compactor:       {Server},
+		IngesterQuerier: {Ring},
+		All:             {Querier, Ingester, Distributor, TableManager, Ruler},
+	}
+
+	// Add IngesterQuerier as a dependency for store when target is either ingester or querier.
+	if t.cfg.Target == Querier || t.cfg.Target == Ruler {
+		deps[Store] = append(deps[Store], IngesterQuerier)
+	}
+
+	// If we are running Loki with boltdb-shipper as a single binary, without clustered mode(which should always be the case when using inmemory ring),
+	// we should start compactor as well for better user experience.
+	if storage.UsingBoltdbShipper(t.cfg.SchemaConfig.Configs) && t.cfg.Ingester.LifecyclerConfig.RingConfig.KVStore.Store == "inmemory" {
+		deps[All] = append(deps[All], Compactor)
 	}
 
 	for mod, targets := range deps {
@@ -316,7 +375,7 @@ func (t *Loki) setupModuleManager() error {
 		}
 	}
 
-	t.moduleManager = mm
+	t.ModuleManager = mm
 
 	return nil
 }

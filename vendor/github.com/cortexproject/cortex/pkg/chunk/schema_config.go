@@ -14,7 +14,6 @@ import (
 	yaml "gopkg.in/yaml.v2"
 
 	"github.com/cortexproject/cortex/pkg/util"
-	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
 const (
@@ -25,9 +24,11 @@ const (
 )
 
 var (
-	errInvalidSchemaVersion = errors.New("invalid schema version")
-	errInvalidTablePeriod   = errors.New("the table period must be a multiple of 24h (1h for schema v1)")
-	errConfigFileNotSet     = errors.New("schema config file needs to be set")
+	errInvalidSchemaVersion     = errors.New("invalid schema version")
+	errInvalidTablePeriod       = errors.New("the table period must be a multiple of 24h (1h for schema v1)")
+	errConfigFileNotSet         = errors.New("schema config file needs to be set")
+	errConfigChunkPrefixNotSet  = errors.New("schema config for chunks is missing the 'prefix' setting")
+	errSchemaIncreasingFromTime = errors.New("from time in schemas must be distinct and in increasing order")
 )
 
 // PeriodConfig defines the schema and tables to use for a period of time
@@ -49,7 +50,7 @@ type DayTime struct {
 
 // MarshalYAML implements yaml.Marshaller.
 func (d DayTime) MarshalYAML() (interface{}, error) {
-	return d.Time.Time().Format("2006-01-02"), nil
+	return d.String(), nil
 }
 
 // UnmarshalYAML implements yaml.Unmarshaller.
@@ -66,32 +67,24 @@ func (d *DayTime) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	return nil
 }
 
+func (d *DayTime) String() string {
+	return d.Time.Time().Format("2006-01-02")
+}
+
 // SchemaConfig contains the config for our chunk index schemas
 type SchemaConfig struct {
 	Configs []PeriodConfig `yaml:"configs"`
 
-	fileName       string
-	legacyFileName string
+	fileName string
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet.
 func (cfg *SchemaConfig) RegisterFlags(f *flag.FlagSet) {
-	flag.StringVar(&cfg.fileName, "schema-config-file", "", "The path to the schema config file.")
-	// TODO(gouthamve): Add a metric for this.
-	flag.StringVar(&cfg.legacyFileName, "config-yaml", "", "DEPRECATED(use -schema-config-file) The path to the schema config file.")
+	f.StringVar(&cfg.fileName, "schema-config-file", "", "The path to the schema config file. The schema config is used only when running Cortex with the chunks storage.")
 }
 
 // loadFromFile loads the schema config from a yaml file
 func (cfg *SchemaConfig) loadFromFile() error {
-	if cfg.fileName == "" {
-		cfg.fileName = cfg.legacyFileName
-
-		if cfg.legacyFileName != "" {
-			flagext.DeprecatedFlagsUsed.Inc()
-			level.Warn(util.Logger).Log("msg", "running with DEPRECATED flag -config-yaml, use -schema-config-file instead")
-		}
-	}
-
 	if cfg.fileName == "" {
 		return errConfigFileNotSet
 	}
@@ -114,6 +107,12 @@ func (cfg *SchemaConfig) Validate() error {
 		periodCfg.applyDefaults()
 		if err := periodCfg.validate(); err != nil {
 			return err
+		}
+
+		if i+1 < len(cfg.Configs) {
+			if cfg.Configs[i].From.Time.Unix() >= cfg.Configs[i+1].From.Time.Unix() {
+				return errSchemaIncreasingFromTime
+			}
 		}
 	}
 	return nil
@@ -141,6 +140,22 @@ func (cfg *SchemaConfig) ForEachAfter(t model.Time, f func(config *PeriodConfig)
 		if cfg.Configs[i].From.Time >= t {
 			f(&cfg.Configs[i])
 		}
+	}
+}
+
+func validateChunks(cfg PeriodConfig) error {
+	objectStore := cfg.IndexType
+	if cfg.ObjectType != "" {
+		objectStore = cfg.ObjectType
+	}
+	switch objectStore {
+	case "cassandra", "aws-dynamo", "bigtable-hashed", "gcp", "gcp-columnkey", "bigtable", "grpc-store":
+		if cfg.ChunkTables.Prefix == "" {
+			return errConfigChunkPrefixNotSet
+		}
+		return nil
+	default:
+		return nil
 	}
 }
 
@@ -205,6 +220,11 @@ func (cfg *PeriodConfig) applyDefaults() {
 
 // Validate the period config.
 func (cfg PeriodConfig) validate() error {
+	validateError := validateChunks(cfg)
+	if validateError != nil {
+		return validateError
+	}
+
 	_, err := cfg.CreateSchema()
 	return err
 }

@@ -5,42 +5,14 @@ import (
 	"time"
 
 	"github.com/cortexproject/cortex/pkg/chunk"
-	"github.com/prometheus/common/model"
-	"github.com/stretchr/testify/assert"
 )
-
-func TestActiveIndexType(t *testing.T) {
-	var cfg chunk.SchemaConfig
-
-	// just one PeriodConfig in the past
-	cfg.Configs = []chunk.PeriodConfig{{
-		From:      chunk.DayTime{Time: model.Now().Add(-24 * time.Hour)},
-		IndexType: "first",
-	}}
-
-	assert.Equal(t, cfg.Configs[0], activePeriodConfig(cfg))
-
-	// add a newer PeriodConfig in the past which should be considered
-	cfg.Configs = append(cfg.Configs, chunk.PeriodConfig{
-		From:      chunk.DayTime{Time: model.Now().Add(-12 * time.Hour)},
-		IndexType: "second",
-	})
-	assert.Equal(t, cfg.Configs[1], activePeriodConfig(cfg))
-
-	// add a newer PeriodConfig in the future which should not be considered
-	cfg.Configs = append(cfg.Configs, chunk.PeriodConfig{
-		From:      chunk.DayTime{Time: model.Now().Add(time.Hour)},
-		IndexType: "third",
-	})
-	assert.Equal(t, cfg.Configs[1], activePeriodConfig(cfg))
-
-}
 
 func Test_calculateMaxLookBack(t *testing.T) {
 	type args struct {
-		pc                chunk.PeriodConfig
-		maxLookBackConfig time.Duration
-		maxChunkAge       time.Duration
+		pc                               chunk.PeriodConfig
+		maxLookBackConfig                time.Duration
+		maxChunkAge                      time.Duration
+		querierBoltDBFilesResyncInterval time.Duration
 	}
 	tests := []struct {
 		name    string
@@ -54,10 +26,11 @@ func Test_calculateMaxLookBack(t *testing.T) {
 				pc: chunk.PeriodConfig{
 					ObjectType: "filesystem",
 				},
-				maxLookBackConfig: 0,
-				maxChunkAge:       1 * time.Hour,
+				maxLookBackConfig:                0,
+				maxChunkAge:                      1 * time.Hour,
+				querierBoltDBFilesResyncInterval: 5 * time.Minute,
 			},
-			want:    90 * time.Minute,
+			want:    81 * time.Minute,
 			wantErr: false,
 		},
 		{
@@ -66,8 +39,9 @@ func Test_calculateMaxLookBack(t *testing.T) {
 				pc: chunk.PeriodConfig{
 					ObjectType: "filesystem",
 				},
-				maxLookBackConfig: -1,
-				maxChunkAge:       1 * time.Hour,
+				maxLookBackConfig:                -1,
+				maxChunkAge:                      1 * time.Hour,
+				querierBoltDBFilesResyncInterval: 5 * time.Minute,
 			},
 			want:    -1,
 			wantErr: false,
@@ -78,8 +52,9 @@ func Test_calculateMaxLookBack(t *testing.T) {
 				pc: chunk.PeriodConfig{
 					ObjectType: "gcs",
 				},
-				maxLookBackConfig: -1,
-				maxChunkAge:       1 * time.Hour,
+				maxLookBackConfig:                -1,
+				maxChunkAge:                      1 * time.Hour,
+				querierBoltDBFilesResyncInterval: 5 * time.Minute,
 			},
 			want:    0,
 			wantErr: true,
@@ -90,8 +65,9 @@ func Test_calculateMaxLookBack(t *testing.T) {
 				pc: chunk.PeriodConfig{
 					ObjectType: "filesystem",
 				},
-				maxLookBackConfig: 1 * time.Hour,
-				maxChunkAge:       1 * time.Hour,
+				maxLookBackConfig:                1 * time.Hour,
+				maxChunkAge:                      1 * time.Hour,
+				querierBoltDBFilesResyncInterval: 5 * time.Minute,
 			},
 			want:    0,
 			wantErr: true,
@@ -99,7 +75,7 @@ func Test_calculateMaxLookBack(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := calculateMaxLookBack(tt.args.pc, tt.args.maxLookBackConfig, tt.args.maxChunkAge)
+			got, err := calculateMaxLookBack(tt.args.pc, tt.args.maxLookBackConfig, tt.args.maxChunkAge, tt.args.querierBoltDBFilesResyncInterval)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("calculateMaxLookBack() error = %v, wantErr %v", err, tt.wantErr)
 				return

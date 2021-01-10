@@ -6,9 +6,9 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 
 	"github.com/cortexproject/cortex/pkg/querier/series"
@@ -56,7 +56,7 @@ func (bqss *blockQuerierSeriesSet) Next() bool {
 		return false
 	}
 
-	currLabels := bqss.series[bqss.next].Labels
+	currLabels := labelpb.ZLabelsToPromLabels(bqss.series[bqss.next].Labels)
 	currChunks := bqss.series[bqss.next].Chunks
 
 	bqss.next++
@@ -64,7 +64,7 @@ func (bqss *blockQuerierSeriesSet) Next() bool {
 	// Merge chunks for current series. Chunks may come in multiple responses, but as soon
 	// as the response has chunks for a new series, we can stop searching. Series are sorted.
 	// See documentation for StoreClient.Series call for details.
-	for bqss.next < len(bqss.series) && storepb.CompareLabels(currLabels, bqss.series[bqss.next].Labels) == 0 {
+	for bqss.next < len(bqss.series) && labels.Compare(currLabels, labelpb.ZLabelsToPromLabels(bqss.series[bqss.next].Labels)) == 0 {
 		currChunks = append(currChunks, bqss.series[bqss.next].Chunks...)
 		bqss.next++
 	}
@@ -86,12 +86,12 @@ func (bqss *blockQuerierSeriesSet) Warnings() storage.Warnings {
 }
 
 // newBlockQuerierSeries makes a new blockQuerierSeries. Input labels must be already sorted by name.
-func newBlockQuerierSeries(lbls []storepb.Label, chunks []storepb.AggrChunk) *blockQuerierSeries {
+func newBlockQuerierSeries(lbls []labels.Label, chunks []storepb.AggrChunk) *blockQuerierSeries {
 	sort.Slice(chunks, func(i, j int) bool {
 		return chunks[i].MinTime < chunks[j].MinTime
 	})
 
-	return &blockQuerierSeries{labels: storepb.LabelsToPromLabelsUnsafe(lbls), chunks: chunks}
+	return &blockQuerierSeries{labels: lbls, chunks: chunks}
 }
 
 type blockQuerierSeries struct {
@@ -207,7 +207,7 @@ func (it *blockQuerierSeriesIterator) Err() error {
 
 	err := it.iterators[it.i].Err()
 	if err != nil {
-		return promql.ErrStorage{Err: errors.Wrapf(err, "cannot iterate chunk for series: %v", it.labels)}
+		return errors.Wrapf(err, "cannot iterate chunk for series: %v", it.labels)
 	}
 	return nil
 }

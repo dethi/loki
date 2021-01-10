@@ -12,6 +12,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/chunk"
 	"github.com/stretchr/testify/require"
 	"github.com/weaveworks/common/httpgrpc"
+	"github.com/weaveworks/common/user"
 
 	"github.com/grafana/loki/pkg/logql"
 )
@@ -24,9 +25,9 @@ func Test_writeError(t *testing.T) {
 		msg            string
 		expectedStatus int
 	}{
-		{"cancelled", context.Canceled, context.Canceled.Error(), StatusClientClosedRequest},
-		{"wrapped cancelled", fmt.Errorf("some context here: %w", context.Canceled), "some context here: " + context.Canceled.Error(), StatusClientClosedRequest},
-		{"deadline", context.DeadlineExceeded, context.DeadlineExceeded.Error(), http.StatusGatewayTimeout},
+		{"cancelled", context.Canceled, ErrClientCanceled, StatusClientClosedRequest},
+		{"orgid", user.ErrNoOrgID, user.ErrNoOrgID.Error(), http.StatusBadRequest},
+		{"deadline", context.DeadlineExceeded, ErrDeadlineExceeded, http.StatusGatewayTimeout},
 		{"parse error", logql.ParseError{}, "parse error : ", http.StatusBadRequest},
 		{"httpgrpc", httpgrpc.Errorf(http.StatusBadRequest, errors.New("foo").Error()), "foo", http.StatusBadRequest},
 		{"internal", errors.New("foo"), "foo", http.StatusInternalServerError},

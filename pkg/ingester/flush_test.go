@@ -2,12 +2,16 @@ package ingester
 
 import (
 	"fmt"
+	"io/ioutil"
+	"os"
 	"sort"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/grafana/loki/pkg/logql"
+	"github.com/grafana/loki/pkg/logql/log"
 
 	"github.com/cortexproject/cortex/pkg/chunk"
 	"github.com/cortexproject/cortex/pkg/ring"
@@ -43,7 +47,7 @@ func TestChunkFlushingIdle(t *testing.T) {
 	cfg.MaxChunkIdle = 100 * time.Millisecond
 	cfg.RetainPeriod = 500 * time.Millisecond
 
-	store, ing := newTestStore(t, cfg)
+	store, ing := newTestStore(t, cfg, nil)
 	defer services.StopAndAwaitTerminated(context.Background(), ing) //nolint:errcheck
 	testData := pushTestSamples(t, ing)
 
@@ -53,7 +57,25 @@ func TestChunkFlushingIdle(t *testing.T) {
 }
 
 func TestChunkFlushingShutdown(t *testing.T) {
-	store, ing := newTestStore(t, defaultIngesterTestConfig(t))
+	store, ing := newTestStore(t, defaultIngesterTestConfig(t), nil)
+	testData := pushTestSamples(t, ing)
+	require.NoError(t, services.StopAndAwaitTerminated(context.Background(), ing))
+	store.checkData(t, testData)
+}
+
+type fullWAL struct{}
+
+func (fullWAL) Log(_ *WALRecord) error { return &os.PathError{Err: syscall.ENOSPC} }
+func (fullWAL) Stop() error            { return nil }
+
+func TestWALFullFlush(t *testing.T) {
+	// technically replaced with a fake wal, but the ingester New() function creates a regular wal first,
+	// so we enable creation/cleanup even though it remains unused.
+	walDir, err := ioutil.TempDir(os.TempDir(), "loki-wal")
+	require.Nil(t, err)
+	defer os.RemoveAll(walDir)
+
+	store, ing := newTestStore(t, defaultIngesterTestConfigWithWAL(t, walDir), fullWAL{})
 	testData := pushTestSamples(t, ing)
 	require.NoError(t, services.StopAndAwaitTerminated(context.Background(), ing))
 	store.checkData(t, testData)
@@ -65,7 +87,7 @@ func TestFlushingCollidingLabels(t *testing.T) {
 	cfg.MaxChunkIdle = 100 * time.Millisecond
 	cfg.RetainPeriod = 500 * time.Millisecond
 
-	store, ing := newTestStore(t, cfg)
+	store, ing := newTestStore(t, cfg, nil)
 	defer store.Stop()
 
 	const userID = "testUser"
@@ -111,7 +133,7 @@ func TestFlushMaxAge(t *testing.T) {
 	cfg.MaxChunkAge = time.Minute
 	cfg.MaxChunkIdle = time.Hour
 
-	store, ing := newTestStore(t, cfg)
+	store, ing := newTestStore(t, cfg, nil)
 	defer store.Stop()
 
 	now := time.Unix(0, 0)
@@ -165,7 +187,10 @@ type testStore struct {
 	chunks map[string][]chunk.Chunk
 }
 
-func newTestStore(t require.TestingT, cfg Config) (*testStore, *Ingester) {
+// Note: the ingester New() function creates it's own WAL first which we then override if specified.
+// Because of this, ensure any WAL directories exist/are cleaned up even when overriding the wal.
+// This is an ugly hook for testing :(
+func newTestStore(t require.TestingT, cfg Config, walOverride WAL) (*testStore, *Ingester) {
 	store := &testStore{
 		chunks: map[string][]chunk.Chunk{},
 	}
@@ -176,6 +201,11 @@ func newTestStore(t require.TestingT, cfg Config) (*testStore, *Ingester) {
 	ing, err := New(cfg, client.Config{}, store, limits, nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), ing))
+
+	if walOverride != nil {
+		_ = ing.wal.Stop()
+		ing.wal = walOverride
+	}
 
 	return store, ing
 }
@@ -196,6 +226,7 @@ func defaultIngesterTestConfig(t *testing.T) Config {
 	cfg.LifecyclerConfig.Addr = "localhost"
 	cfg.LifecyclerConfig.ID = "localhost"
 	cfg.LifecyclerConfig.FinalSleep = 0
+	cfg.LifecyclerConfig.MinReadyDuration = 0
 	return cfg
 }
 
@@ -235,6 +266,14 @@ func (s *testStore) SelectLogs(ctx context.Context, req logql.SelectLogParams) (
 
 func (s *testStore) SelectSamples(ctx context.Context, req logql.SelectSampleParams) (iter.SampleIterator, error) {
 	return nil, nil
+}
+
+func (s *testStore) GetChunkRefs(ctx context.Context, userID string, from, through model.Time, matchers ...*labels.Matcher) ([][]chunk.Chunk, []*chunk.Fetcher, error) {
+	return nil, nil, nil
+}
+
+func (s *testStore) GetSchemaConfigs() []chunk.PeriodConfig {
+	return nil
 }
 
 func (s *testStore) Stop() {}
@@ -311,12 +350,12 @@ func (s *testStore) getChunksForUser(userID string) []chunk.Chunk {
 	return s.chunks[userID]
 }
 
-func buildStreamsFromChunk(t *testing.T, labels string, chk chunkenc.Chunk) logproto.Stream {
-	it, err := chk.Iterator(context.TODO(), time.Unix(0, 0), time.Unix(1000, 0), logproto.FORWARD, nil)
+func buildStreamsFromChunk(t *testing.T, lbs string, chk chunkenc.Chunk) logproto.Stream {
+	it, err := chk.Iterator(context.TODO(), time.Unix(0, 0), time.Unix(1000, 0), logproto.FORWARD, log.NewNoopPipeline().ForStream(labels.Labels{}))
 	require.NoError(t, err)
 
 	stream := logproto.Stream{
-		Labels: labels,
+		Labels: lbs,
 	}
 	for it.Next() {
 		stream.Entries = append(stream.Entries, it.Entry())

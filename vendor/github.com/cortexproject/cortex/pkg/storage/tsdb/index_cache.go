@@ -44,12 +44,12 @@ type IndexCacheConfig struct {
 }
 
 func (cfg *IndexCacheConfig) RegisterFlags(f *flag.FlagSet) {
-	cfg.RegisterFlagsWithPrefix(f, "experimental.tsdb.bucket-store.index-cache.")
+	cfg.RegisterFlagsWithPrefix(f, "blocks-storage.bucket-store.index-cache.")
 }
 
 func (cfg *IndexCacheConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.StringVar(&cfg.Backend, prefix+"backend", IndexCacheBackendDefault, fmt.Sprintf("The index cache backend type. Supported values: %s.", strings.Join(supportedIndexCacheBackends, ", ")))
-	f.BoolVar(&cfg.PostingsCompression, prefix+"postings-compression-enabled", false, "Compress postings before storing them to postings cache.")
+	f.BoolVar(&cfg.PostingsCompression, prefix+"postings-compression-enabled", false, "Deprecated: compress postings before storing them to postings cache. This option is unused and postings compression is always enabled.") // TODO remove in v1.8.0.
 
 	cfg.InMemory.RegisterFlagsWithPrefix(f, prefix+"inmemory.")
 	cfg.Memcached.RegisterFlagsWithPrefix(f, prefix+"memcached.")

@@ -83,7 +83,9 @@ func (h *splitByInterval) Process(
 	parallelism int,
 	threshold int64,
 	input []*lokiResult,
-) (responses []queryrange.Response, err error) {
+	userID string,
+) ([]queryrange.Response, error) {
+	var responses []queryrange.Response
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -101,8 +103,10 @@ func (h *splitByInterval) Process(
 		p = len(input)
 	}
 
+	// per request wrapped handler for limiting the amount of series.
+	next := newSeriesLimiter(h.limits.MaxQuerySeries(userID)).Wrap(h.next)
 	for i := 0; i < p; i++ {
-		go h.loop(ctx, ch)
+		go h.loop(ctx, ch, next)
 	}
 
 	for _, x := range input {
@@ -111,7 +115,7 @@ func (h *splitByInterval) Process(
 			return nil, ctx.Err()
 		case data := <-x.ch:
 			if data.err != nil {
-				return nil, err
+				return nil, data.err
 			}
 
 			responses = append(responses, data.resp)
@@ -133,14 +137,14 @@ func (h *splitByInterval) Process(
 	return responses, nil
 }
 
-func (h *splitByInterval) loop(ctx context.Context, ch <-chan *lokiResult) {
+func (h *splitByInterval) loop(ctx context.Context, ch <-chan *lokiResult, next queryrange.Handler) {
 
 	for data := range ch {
 
 		sp, ctx := opentracing.StartSpanFromContext(ctx, "interval")
 		data.req.LogToSpan(sp)
 
-		resp, err := h.next.Do(ctx, data.req)
+		resp, err := next.Do(ctx, data.req)
 
 		select {
 		case <-ctx.Done():
@@ -153,7 +157,6 @@ func (h *splitByInterval) loop(ctx context.Context, ch <-chan *lokiResult) {
 }
 
 func (h *splitByInterval) Do(ctx context.Context, r queryrange.Request) (queryrange.Response, error) {
-	//lokiRequest := r.(*LokiRequest)
 
 	userid, err := user.ExtractOrgID(ctx)
 	if err != nil {
@@ -188,8 +191,8 @@ func (h *splitByInterval) Do(ctx context.Context, r queryrange.Request) (queryra
 				intervals[i], intervals[j] = intervals[j], intervals[i]
 			}
 		}
-	case *LokiSeriesRequest:
-		// Set this to 0 since this is not used in Series Request.
+	case *LokiSeriesRequest, *LokiLabelNamesRequest:
+		// Set this to 0 since this is not used in Series/Labels Request.
 		limit = 0
 	default:
 		return nil, httpgrpc.Errorf(http.StatusBadRequest, "unknown request type")
@@ -203,7 +206,7 @@ func (h *splitByInterval) Do(ctx context.Context, r queryrange.Request) (queryra
 		})
 	}
 
-	resps, err := h.Process(ctx, h.limits.MaxQueryParallelism(userid), limit, input)
+	resps, err := h.Process(ctx, h.limits.MaxQueryParallelism(userid), limit, input, userid)
 	if err != nil {
 		return nil, err
 	}
@@ -215,11 +218,7 @@ func splitByTime(req queryrange.Request, interval time.Duration) []queryrange.Re
 
 	switch r := req.(type) {
 	case *LokiRequest:
-		for start := r.StartTs; start.Before(r.EndTs); start = start.Add(interval) {
-			end := start.Add(interval)
-			if end.After(r.EndTs) {
-				end = r.EndTs
-			}
+		forInterval(interval, r.StartTs, r.EndTs, func(start, end time.Time) {
 			reqs = append(reqs, &LokiRequest{
 				Query:     r.Query,
 				Limit:     r.Limit,
@@ -229,23 +228,37 @@ func splitByTime(req queryrange.Request, interval time.Duration) []queryrange.Re
 				StartTs:   start,
 				EndTs:     end,
 			})
-		}
-		return reqs
+		})
 	case *LokiSeriesRequest:
-		for start := r.StartTs; start.Before(r.EndTs); start = start.Add(interval) {
-			end := start.Add(interval)
-			if end.After(r.EndTs) {
-				end = r.EndTs
-			}
+		forInterval(interval, r.StartTs, r.EndTs, func(start, end time.Time) {
 			reqs = append(reqs, &LokiSeriesRequest{
 				Match:   r.Match,
 				Path:    r.Path,
 				StartTs: start,
 				EndTs:   end,
 			})
-		}
-		return reqs
+		})
+	case *LokiLabelNamesRequest:
+		forInterval(interval, r.StartTs, r.EndTs, func(start, end time.Time) {
+			reqs = append(reqs, &LokiLabelNamesRequest{
+				Path:    r.Path,
+				StartTs: start,
+				EndTs:   end,
+			})
+		})
 	default:
 		return nil
+	}
+	return reqs
+
+}
+
+func forInterval(interval time.Duration, start, end time.Time, callback func(start, end time.Time)) {
+	for start := start; start.Before(end); start = start.Add(interval) {
+		newEnd := start.Add(interval)
+		if newEnd.After(end) {
+			newEnd = end
+		}
+		callback(start, newEnd)
 	}
 }

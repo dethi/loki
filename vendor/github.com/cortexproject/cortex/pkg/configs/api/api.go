@@ -18,10 +18,11 @@ import (
 	"github.com/go-kit/kit/log/level"
 	"github.com/gorilla/mux"
 	amconfig "github.com/prometheus/alertmanager/config"
-	"github.com/weaveworks/common/user"
+	amtemplate "github.com/prometheus/alertmanager/template"
 
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
+	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 )
 
@@ -107,7 +108,7 @@ func (a *API) RegisterRoutes(r *mux.Router) {
 
 // getConfig returns the request configuration.
 func (a *API) getConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := user.ExtractOrgIDFromHTTPRequest(r)
+	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -145,7 +146,7 @@ func (a *API) getConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) setConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := user.ExtractOrgIDFromHTTPRequest(r)
+	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -247,7 +248,7 @@ func validateRulesFiles(c userconfig.Config) error {
 
 func validateTemplateFiles(c userconfig.Config) error {
 	for fn, content := range c.TemplateFiles {
-		if _, err := template.New(fn).Parse(content); err != nil {
+		if _, err := template.New(fn).Funcs(template.FuncMap(amtemplate.DefaultFuncs)).Parse(content); err != nil {
 			return err
 		}
 	}
@@ -295,7 +296,7 @@ func (a *API) getConfigs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) deactivateConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := user.ExtractOrgIDFromHTTPRequest(r)
+	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -317,7 +318,7 @@ func (a *API) deactivateConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) restoreConfig(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := user.ExtractOrgIDFromHTTPRequest(r)
+	userID, _, err := tenant.ExtractTenantIDFromHTTPRequest(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return

@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"net/http"
-	"sync/atomic"
 	"time"
 
 	cortex_distributor "github.com/cortexproject/cortex/pkg/distributor"
@@ -13,7 +12,9 @@ import (
 	cortex_util "github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/limiter"
 	"github.com/cortexproject/cortex/pkg/util/services"
+	lru "github.com/hashicorp/golang-lru"
 	"github.com/pkg/errors"
+	"go.uber.org/atomic"
 
 	"github.com/opentracing/opentracing-go"
 	"github.com/prometheus/client_golang/prometheus"
@@ -24,6 +25,7 @@ import (
 
 	"github.com/grafana/loki/pkg/ingester/client"
 	"github.com/grafana/loki/pkg/logproto"
+	"github.com/grafana/loki/pkg/logql"
 	"github.com/grafana/loki/pkg/util"
 	"github.com/grafana/loki/pkg/util/validation"
 )
@@ -50,6 +52,8 @@ var (
 		Name:      "distributor_lines_received_total",
 		Help:      "The total number of lines received per tenant",
 	}, []string{"tenant"})
+
+	maxLabelCacheSize = 100000
 )
 
 // Config for a Distributor.
@@ -85,6 +89,7 @@ type Distributor struct {
 
 	// Per-user rate limiter.
 	ingestionRateLimiter *limiter.RateLimiter
+	labelCache           *lru.Cache
 }
 
 // New a distributor creates.
@@ -120,6 +125,10 @@ func New(cfg Config, clientCfg client.Config, ingestersRing ring.ReadRing, overr
 		ingestionRateStrategy = newLocalIngestionRateStrategy(overrides)
 	}
 
+	labelCache, err := lru.New(maxLabelCacheSize)
+	if err != nil {
+		return nil, err
+	}
 	d := Distributor{
 		cfg:                  cfg,
 		clientCfg:            clientCfg,
@@ -128,6 +137,7 @@ func New(cfg Config, clientCfg client.Config, ingestersRing ring.ReadRing, overr
 		validator:            validator,
 		pool:                 cortex_distributor.NewPool(clientCfg.PoolConfig, ingestersRing, factory, cortex_util.Logger),
 		ingestionRateLimiter: limiter.NewRateLimiter(ingestionRateStrategy, 10*time.Second),
+		labelCache:           labelCache,
 	}
 
 	servs = append(servs, d.pool)
@@ -164,14 +174,14 @@ type streamTracker struct {
 	stream      logproto.Stream
 	minSuccess  int
 	maxFailures int
-	succeeded   int32
-	failed      int32
+	succeeded   atomic.Int32
+	failed      atomic.Int32
 }
 
 // TODO taken from Cortex, see if we can refactor out an usable interface.
 type pushTracker struct {
-	samplesPending int32
-	samplesFailed  int32
+	samplesPending atomic.Int32
+	samplesFailed  atomic.Int32
 	done           chan struct{}
 	err            chan error
 }
@@ -204,27 +214,30 @@ func (d *Distributor) Push(ctx context.Context, req *logproto.PushRequest) (*log
 	validatedSamplesSize := 0
 	validatedSamplesCount := 0
 
+	validationContext := d.validator.getValidationContextFor(userID)
+
 	for _, stream := range req.Streams {
-		if err := d.validator.ValidateLabels(userID, stream); err != nil {
+		stream.Labels, err = d.parseStreamLabels(validationContext, stream.Labels, &stream)
+		if err != nil {
 			validationErr = err
 			continue
 		}
-
-		entries := make([]logproto.Entry, 0, len(stream.Entries))
+		n := 0
 		for _, entry := range stream.Entries {
-			if err := d.validator.ValidateEntry(userID, stream.Labels, entry); err != nil {
+			if err := d.validator.ValidateEntry(validationContext, stream.Labels, entry); err != nil {
 				validationErr = err
 				continue
 			}
-			entries = append(entries, entry)
+			stream.Entries[n] = entry
+			n++
 			validatedSamplesSize += len(entry.Line)
 			validatedSamplesCount++
 		}
+		stream.Entries = stream.Entries[:n]
 
-		if len(entries) == 0 {
+		if len(stream.Entries) == 0 {
 			continue
 		}
-		stream.Entries = entries
 		keys = append(keys, util.TokenFor(userID, stream.Labels))
 		streams = append(streams, streamTracker{
 			stream: stream,
@@ -263,10 +276,10 @@ func (d *Distributor) Push(ctx context.Context, req *logproto.PushRequest) (*log
 	}
 
 	tracker := pushTracker{
-		samplesPending: int32(len(streams)),
-		done:           make(chan struct{}),
-		err:            make(chan error),
+		done: make(chan struct{}),
+		err:  make(chan error),
 	}
+	tracker.samplesPending.Store(int32(len(streams)))
 	for ingester, samples := range samplesByIngester {
 		go func(ingester ring.IngesterDesc, samples []*streamTracker) {
 			// Use a background context to make sure all ingesters get samples even if we return early
@@ -304,17 +317,17 @@ func (d *Distributor) sendSamples(ctx context.Context, ingester ring.IngesterDes
 	// goroutine will write to either channel.
 	for i := range streamTrackers {
 		if err != nil {
-			if atomic.AddInt32(&streamTrackers[i].failed, 1) <= int32(streamTrackers[i].maxFailures) {
+			if streamTrackers[i].failed.Inc() <= int32(streamTrackers[i].maxFailures) {
 				continue
 			}
-			if atomic.AddInt32(&pushTracker.samplesFailed, 1) == 1 {
+			if pushTracker.samplesFailed.Inc() == 1 {
 				pushTracker.err <- err
 			}
 		} else {
-			if atomic.AddInt32(&streamTrackers[i].succeeded, 1) != int32(streamTrackers[i].minSuccess) {
+			if streamTrackers[i].succeeded.Inc() != int32(streamTrackers[i].minSuccess) {
 				continue
 			}
-			if atomic.AddInt32(&pushTracker.samplesPending, -1) == 0 {
+			if pushTracker.samplesPending.Dec() == 0 {
 				pushTracker.done <- struct{}{}
 			}
 		}
@@ -346,4 +359,22 @@ func (d *Distributor) sendSamplesErr(ctx context.Context, ingester ring.Ingester
 // Check implements the grpc healthcheck
 func (*Distributor) Check(_ context.Context, _ *grpc_health_v1.HealthCheckRequest) (*grpc_health_v1.HealthCheckResponse, error) {
 	return &grpc_health_v1.HealthCheckResponse{Status: grpc_health_v1.HealthCheckResponse_SERVING}, nil
+}
+
+func (d *Distributor) parseStreamLabels(vContext validationContext, key string, stream *logproto.Stream) (string, error) {
+	labelVal, ok := d.labelCache.Get(key)
+	if ok {
+		return labelVal.(string), nil
+	}
+	ls, err := logql.ParseLabels(key)
+	if err != nil {
+		return "", httpgrpc.Errorf(http.StatusBadRequest, "error parsing labels: %v", err)
+	}
+	// ensure labels are correctly sorted.
+	if err := d.validator.ValidateLabels(vContext, ls, *stream); err != nil {
+		return "", err
+	}
+	lsVal := ls.String()
+	d.labelCache.Add(key, lsVal)
+	return lsVal, nil
 }

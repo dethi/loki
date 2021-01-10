@@ -662,7 +662,7 @@ func matchFilterLabels(matchers []*labels.Matcher, sms map[string]string) bool {
 			if string(m.Value) == "" && !prs {
 				continue
 			}
-			if !prs || !m.Matches(string(v)) {
+			if !m.Matches(string(v)) {
 				return false
 			}
 		}
@@ -747,7 +747,7 @@ func (api *API) respond(w http.ResponseWriter, data interface{}) {
 		Data:   data,
 	})
 	if err != nil {
-		level.Error(api.logger).Log("msg", "Error marshalling JSON", "err", err)
+		level.Error(api.logger).Log("msg", "Error marshaling JSON", "err", err)
 		return
 	}
 

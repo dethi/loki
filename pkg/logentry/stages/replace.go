@@ -41,10 +41,6 @@ func validateReplaceConfig(c *ReplaceConfig) (*regexp.Regexp, error) {
 		return nil, errors.New(ErrEmptyReplaceStageSource)
 	}
 
-	if c.Replace == "" {
-		return nil, errors.New(ErrEmptyReplaceStageConfig)
-	}
-
 	expr, err := regexp.Compile(c.Expression)
 	if err != nil {
 		return nil, errors.Wrap(err, ErrCouldNotCompileRegex)
@@ -70,11 +66,11 @@ func newReplaceStage(logger log.Logger, config interface{}) (Stage, error) {
 		return nil, err
 	}
 
-	return &replaceStage{
+	return toStage(&replaceStage{
 		cfg:        cfg,
 		expression: expression,
 		logger:     log.With(logger, "component", "stage", "type", "replace"),
-	}, nil
+	}), nil
 }
 
 // parseReplaceConfig processes an incoming configuration into a ReplaceConfig

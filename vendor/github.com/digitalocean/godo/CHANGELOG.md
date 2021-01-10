@@ -1,5 +1,90 @@
 # Change Log
 
+## [v1.52.0] - 2020-11-05
+
+- #411 - @nicktate - apps: add unspecified type to image source registry types
+- #409 - @andrewsomething - registry: Add support for updating a subscription.
+- #408 - @nicktate - apps: update spec to include image source
+- #407 - @kamaln7 - apps: add the option to force build a new deployment
+
+## [v1.51.0] - 2020-11-02
+
+- #405 - @adamwg - registry: Support subscription options
+- #398 - @reeseconor - Add support for caching dependencies between GitHub Action runs
+- #404 - @andrewsomething - CONTRIBUTING.md: Suggest using github-changelog-generator.
+
+## [v1.50.0] - 2020-10-26
+
+- #400 - @waynr - registry: add garbage collection support
+- #402 - @snormore - apps: add catchall_document static site spec field and failed-deploy job type
+- #401 - @andrewlouis93 - VPC: adds option to set a VPC as the regional default
+
+## [v1.49.0] - 2020-10-21
+
+- #383 - @kamaln7 - apps: add ListRegions, Get/ListTiers, Get/ListInstanceSizes
+- #390 - @snormore - apps: add service spec internal_ports
+
+## [v1.48.0] - 2020-10-16
+
+- #388 - @varshavaradarajan - kubernetes - change docr integration api routes
+- #386 - @snormore - apps: pull in recent updates to jobs and domains
+
+## [v1.47.0] - 2020-10-14
+
+- #384 kubernetes - add registry related doks apis - @varshavaradarajan
+- #385 Fixed some typo in apps.gen.go and databases.go file - @devil-cyber
+- #382 Add GetKubeConfigWithExpiry (#334) - @ivanlemeshev
+- #381 Fix golint issues #377 - @sidsbrmnn
+- #380 refactor: Cyclomatic complexity issue - @DonRenando
+- #379 Run gofmt to fix some issues in codebase - @mycodeself
+
+## [v1.46.0] - 2020-10-05
+
+- #373 load balancers: add LB size field, currently in closed beta - @anitgandhi
+
+## [v1.45.0] - 2020-09-25
+
+**Note**: This release contains breaking changes to App Platform features currently in closed beta.
+
+- #369 update apps types to latest - @kamaln7
+- #368 Kubernetes: add taints field to node pool create and update requests - @timoreimann
+- #367 update apps types, address marshaling bug - @kamaln7
+
+## [v1.44.0] - 2020-09-08
+
+- #364 apps: support aggregate deployment logs - @kamaln7
+
+## [v1.43.0] - 2020-09-08
+
+- #362 update apps types - @kamaln7
+
+## [v1.42.1] - 2020-08-06
+
+- #360 domains: Allow for SRV records with port 0. - @andrewsomething
+
+## [v1.42.0] - 2020-07-22
+
+- #357 invoices: add category to InvoiceItem - @rbutler
+- #358 apps: add support for following logs - @nanzhong
+
+## [v1.41.0] - 2020-07-17
+
+- #355 kubernetes: Add support for surge upgrades - @varshavaradarajan
+
+## [v1.40.0] - 2020-07-16
+
+- #347 Make Rate limits thread safe - @roidelapluie
+- #353 Reuse TCP connection - @itsksaurabh
+
+## [v1.39.0] - 2020-07-14
+
+- #345, #346 Add app platform support [beta] - @nanzhong
+
+## [v1.38.0] - 2020-06-18
+
+- #341 Install 1-click applications on a Kubernetes cluster - @keladhruv
+- #340 Add RecordsByType, RecordsByName and RecordsByTypeAndName to the DomainsService - @viola
+
 ## [v1.37.0] - 2020-06-01
 
 - #336 registry: URL encode repository names when building URLs. @adamwg

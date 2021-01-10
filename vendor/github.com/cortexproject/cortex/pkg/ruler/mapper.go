@@ -8,10 +8,9 @@ import (
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
+	"github.com/prometheus/prometheus/pkg/rulefmt"
 	"github.com/spf13/afero"
-	"gopkg.in/yaml.v2"
-
-	legacy_rulefmt "github.com/cortexproject/cortex/pkg/ruler/legacy_rulefmt"
+	"gopkg.in/yaml.v3"
 )
 
 // mapper is designed to enusre the provided rule sets are identical
@@ -24,14 +23,38 @@ type mapper struct {
 }
 
 func newMapper(path string, logger log.Logger) *mapper {
-	return &mapper{
+	m := &mapper{
 		Path:   path,
 		FS:     afero.NewOsFs(),
 		logger: logger,
 	}
+	m.cleanup()
+
+	return m
 }
 
-func (m *mapper) MapRules(user string, ruleConfigs map[string][]legacy_rulefmt.RuleGroup) (bool, []string, error) {
+// cleanup removes all of the user directories in the path of the mapper
+func (m *mapper) cleanup() {
+	level.Info(m.logger).Log("msg", "cleaning up mapped rules directory", "path", m.Path)
+
+	existingUsers, err := afero.ReadDir(m.FS, m.Path)
+	if err != nil {
+		level.Error(m.logger).Log("msg", "unable to read rules directory", "path", m.Path, "err", err)
+		return
+	}
+
+	for _, u := range existingUsers {
+		if u.IsDir() {
+			dirPath := filepath.Join(m.Path, u.Name())
+			err = m.FS.RemoveAll(dirPath)
+			if err != nil {
+				level.Warn(m.logger).Log("msg", "unable to remove user directory", "path", dirPath, "err", err)
+			}
+		}
+	}
+}
+
+func (m *mapper) MapRules(user string, ruleConfigs map[string][]rulefmt.RuleGroup) (bool, []string, error) {
 	anyUpdated := false
 	filenames := []string{}
 
@@ -86,12 +109,12 @@ func (m *mapper) MapRules(user string, ruleConfigs map[string][]legacy_rulefmt.R
 	return anyUpdated, filenames, nil
 }
 
-func (m *mapper) writeRuleGroupsIfNewer(groups []legacy_rulefmt.RuleGroup, filename string) (bool, error) {
+func (m *mapper) writeRuleGroupsIfNewer(groups []rulefmt.RuleGroup, filename string) (bool, error) {
 	sort.Slice(groups, func(i, j int) bool {
 		return groups[i].Name > groups[j].Name
 	})
 
-	rgs := legacy_rulefmt.RuleGroups{Groups: groups}
+	rgs := rulefmt.RuleGroups{Groups: groups}
 
 	d, err := yaml.Marshal(&rgs)
 	if err != nil {

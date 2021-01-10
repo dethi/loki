@@ -21,7 +21,7 @@ func RemoteReadHandler(q storage.Queryable) http.Handler {
 		ctx := r.Context()
 		var req client.ReadRequest
 		logger := util.WithContext(r.Context(), util.Logger)
-		if _, err := util.ParseProtoReader(ctx, r.Body, int(r.ContentLength), maxRemoteReadQuerySize, &req, compressionType); err != nil {
+		if err := util.ParseProtoReader(ctx, r.Body, int(r.ContentLength), maxRemoteReadQuerySize, &req, compressionType); err != nil {
 			level.Error(logger).Log("err", err.Error())
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -67,7 +67,7 @@ func RemoteReadHandler(q storage.Queryable) http.Handler {
 			http.Error(w, lastErr.Error(), http.StatusBadRequest)
 			return
 		}
-
+		w.Header().Add("Content-Type", "application/x-protobuf")
 		if err := util.SerializeProtoResponse(w, &resp, compressionType); err != nil {
 			level.Error(logger).Log("msg", "error sending remote read response", "err", err)
 		}

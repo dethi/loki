@@ -1,11 +1,8 @@
 loki:
-  fullnameOverride: loki
   enabled: true
 
 promtail:
   enabled: true
-  loki:
-    serviceName: loki
 
 fluent-bit:
   enabled: false
@@ -41,10 +38,8 @@ filebeat:
 
 logstash:
   enabled: false
-  fullnameOverride: logstash-loki
-  image:
-    repository: grafana/logstash-output-loki
-    tag: 1.0.1
+  image: grafana/logstash-output-loki
+  imageTag: 1.0.1
   filters:
     main: |-
       filter {

@@ -17,11 +17,13 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/tsdb/fileutil"
-	"github.com/thanos-io/thanos/pkg/component"
-	"github.com/thanos-io/thanos/pkg/runutil"
-	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/thanos-io/thanos/pkg/component"
+	"github.com/thanos-io/thanos/pkg/runutil"
+	"github.com/thanos-io/thanos/pkg/store/labelpb"
+	"github.com/thanos-io/thanos/pkg/store/storepb"
 )
 
 // LocalStore implements the store API against single file with stream of proto-based SeriesResponses in JSON format.
@@ -66,8 +68,8 @@ func NewLocalStoreFromJSONMmappableFile(
 		extLabels: extLabels,
 		c:         f,
 		info: &storepb.InfoResponse{
-			LabelSets: []storepb.LabelSet{
-				{Labels: storepb.PromLabelsToLabelsUnsafe(extLabels)},
+			LabelSets: []labelpb.ZLabelSet{
+				{Labels: labelpb.ZLabelsFromPromLabels(extLabels)},
 			},
 			StoreType: component.ToProto(),
 			MinTime:   math.MaxInt64,
@@ -86,10 +88,10 @@ func NewLocalStoreFromJSONMmappableFile(
 		content = content[:idx+1]
 	}
 
-	scanner := NewNoCopyScanner(content, split)
+	skanner := NewNoCopyScanner(content, split)
 	resp := &storepb.SeriesResponse{}
-	for scanner.Scan() {
-		if err := jsonpb.Unmarshal(bytes.NewReader(scanner.Bytes()), resp); err != nil {
+	for skanner.Scan() {
+		if err := jsonpb.Unmarshal(bytes.NewReader(skanner.Bytes()), resp); err != nil {
 			return nil, errors.Wrapf(err, "unmarshal storepb.SeriesResponse frame for file %s", path)
 		}
 		series := resp.GetSeries()
@@ -116,7 +118,7 @@ func NewLocalStoreFromJSONMmappableFile(
 		s.sortedChunks = append(s.sortedChunks, chks)
 	}
 
-	if err := scanner.Err(); err != nil {
+	if err := skanner.Err(); err != nil {
 		return nil, errors.Wrapf(err, "scanning file %s", path)
 	}
 	level.Info(logger).Log("msg", "loading JSON file succeeded", "file", path, "info", s.info.String(), "series", len(s.series))
@@ -167,7 +169,7 @@ func (s *LocalStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSe
 
 	var chosen []int
 	for si, series := range s.series {
-		lbls := storepb.LabelsToPromLabelsUnsafe(series.Labels)
+		lbls := labelpb.ZLabelsToPromLabels(series.Labels)
 		var noMatch bool
 		for _, m := range matchers {
 			extValue := lbls.Get(m.Name)
@@ -235,7 +237,7 @@ func (s *LocalStore) LabelValues(_ context.Context, r *storepb.LabelValuesReques
 ) {
 	vals := map[string]struct{}{}
 	for _, series := range s.series {
-		lbls := storepb.LabelsToPromLabelsUnsafe(series.Labels)
+		lbls := labelpb.ZLabelsToPromLabels(series.Labels)
 		val := lbls.Get(r.Label)
 		if val == "" {
 			continue

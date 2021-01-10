@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/alecthomas/units"
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/pkg/errors"
@@ -33,6 +34,8 @@ import (
 	"github.com/prometheus/alertmanager/template"
 	"github.com/prometheus/alertmanager/types"
 )
+
+const maxEventSize int = 512000
 
 // Notifier implements a Notifier for PagerDuty notifications.
 type Notifier struct {
@@ -46,7 +49,7 @@ type Notifier struct {
 
 // New returns a new PagerDuty notifier.
 func New(c *config.PagerdutyConfig, t *template.Template, l log.Logger) (*Notifier, error) {
-	client, err := commoncfg.NewClientFromConfig(*c.HTTPConfig, "pagerduty", false)
+	client, err := commoncfg.NewClientFromConfig(*c.HTTPConfig, "pagerduty", false, false)
 	if err != nil {
 		return nil, err
 	}
@@ -107,6 +110,33 @@ type pagerDutyPayload struct {
 	CustomDetails map[string]string `json:"custom_details,omitempty"`
 }
 
+func (n *Notifier) encodeMessage(msg *pagerDutyMessage) (bytes.Buffer, error) {
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(msg); err != nil {
+		return buf, errors.Wrap(err, "failed to encode PagerDuty message")
+	}
+
+	if buf.Len() > maxEventSize {
+		truncatedMsg := fmt.Sprintf("Custom details have been removed because the original event exceeds the maximum size of %s", units.MetricBytes(maxEventSize).String())
+
+		if n.apiV1 != "" {
+			msg.Details = map[string]string{"error": truncatedMsg}
+		} else {
+			msg.Payload.CustomDetails = map[string]string{"error": truncatedMsg}
+		}
+
+		warningMsg := fmt.Sprintf("Truncated Details because message of size %s exceeds limit %s", units.MetricBytes(buf.Len()).String(), units.MetricBytes(maxEventSize).String())
+		level.Warn(n.logger).Log("msg", warningMsg)
+
+		buf.Reset()
+		if err := json.NewEncoder(&buf).Encode(msg); err != nil {
+			return buf, errors.Wrap(err, "failed to encode PagerDuty message")
+		}
+	}
+
+	return buf, nil
+}
+
 func (n *Notifier) notifyV1(
 	ctx context.Context,
 	eventType string,
@@ -145,12 +175,12 @@ func (n *Notifier) notifyV1(
 		return false, errors.New("service key cannot be empty")
 	}
 
-	var buf bytes.Buffer
-	if err := json.NewEncoder(&buf).Encode(msg); err != nil {
-		return false, errors.Wrap(err, "failed to encode PagerDuty v1 message")
+	encodedMsg, err := n.encodeMessage(msg)
+	if err != nil {
+		return false, err
 	}
 
-	resp, err := notify.PostJSON(ctx, n.client, n.apiV1, &buf)
+	resp, err := notify.PostJSON(ctx, n.client, n.apiV1, &encodedMsg)
 	if err != nil {
 		return true, errors.Wrap(err, "failed to post message to PagerDuty v1")
 	}
@@ -185,8 +215,8 @@ func (n *Notifier) notifyV2(
 		RoutingKey:  tmpl(string(n.conf.RoutingKey)),
 		EventAction: eventType,
 		DedupKey:    key.Hash(),
-		Images:      make([]pagerDutyImage, len(n.conf.Images)),
-		Links:       make([]pagerDutyLink, len(n.conf.Links)),
+		Images:      make([]pagerDutyImage, 0, len(n.conf.Images)),
+		Links:       make([]pagerDutyLink, 0, len(n.conf.Links)),
 		Payload: &pagerDutyPayload{
 			Summary:       summary,
 			Source:        tmpl(n.conf.Client),
@@ -198,15 +228,27 @@ func (n *Notifier) notifyV2(
 		},
 	}
 
-	for index, item := range n.conf.Images {
-		msg.Images[index].Src = tmpl(item.Src)
-		msg.Images[index].Alt = tmpl(item.Alt)
-		msg.Images[index].Href = tmpl(item.Href)
+	for _, item := range n.conf.Images {
+		image := pagerDutyImage{
+			Src:  tmpl(item.Src),
+			Alt:  tmpl(item.Alt),
+			Href: tmpl(item.Href),
+		}
+
+		if image.Src != "" {
+			msg.Images = append(msg.Images, image)
+		}
 	}
 
-	for index, item := range n.conf.Links {
-		msg.Links[index].HRef = tmpl(item.Href)
-		msg.Links[index].Text = tmpl(item.Text)
+	for _, item := range n.conf.Links {
+		link := pagerDutyLink{
+			HRef: tmpl(item.Href),
+			Text: tmpl(item.Text),
+		}
+
+		if link.HRef != "" {
+			msg.Links = append(msg.Links, link)
+		}
 	}
 
 	if tmplErr != nil {
@@ -218,12 +260,12 @@ func (n *Notifier) notifyV2(
 		return false, errors.New("routing key cannot be empty")
 	}
 
-	var buf bytes.Buffer
-	if err := json.NewEncoder(&buf).Encode(msg); err != nil {
-		return false, errors.Wrap(err, "failed to encode PagerDuty v2 message")
+	encodedMsg, err := n.encodeMessage(msg)
+	if err != nil {
+		return false, err
 	}
 
-	resp, err := notify.PostJSON(ctx, n.client, n.conf.URL.String(), &buf)
+	resp, err := notify.PostJSON(ctx, n.client, n.conf.URL.String(), &encodedMsg)
 	if err != nil {
 		return true, errors.Wrap(err, "failed to post message to PagerDuty")
 	}

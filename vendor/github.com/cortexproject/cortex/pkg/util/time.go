@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/prometheus/common/model"
 	"github.com/weaveworks/common/httpgrpc"
 )
 
@@ -23,10 +24,21 @@ func TimeFromMillis(ms int64) time.Time {
 	return time.Unix(0, ms*nanosecondsInMillisecond)
 }
 
+// FormatTimeMillis returns a human readable version of the input time (in milliseconds).
+func FormatTimeMillis(ms int64) string {
+	return TimeFromMillis(ms).String()
+}
+
+// FormatTimeModel returns a human readable version of the input time.
+func FormatTimeModel(t model.Time) string {
+	return TimeFromMillis(int64(t)).String()
+}
+
 // ParseTime parses the string into an int64, milliseconds since epoch.
 func ParseTime(s string) (int64, error) {
 	if t, err := strconv.ParseFloat(s, 64); err == nil {
 		s, ns := math.Modf(t)
+		ns = math.Round(ns*1000) / 1000
 		tm := time.Unix(int64(s), int64(ns*float64(time.Second)))
 		return TimeToMillis(tm), nil
 	}

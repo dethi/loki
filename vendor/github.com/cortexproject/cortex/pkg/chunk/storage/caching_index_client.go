@@ -5,16 +5,16 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/gogo/protobuf/proto"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/weaveworks/common/user"
 
 	"github.com/cortexproject/cortex/pkg/chunk"
 	"github.com/cortexproject/cortex/pkg/chunk/cache"
 	chunk_util "github.com/cortexproject/cortex/pkg/chunk/util"
-	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
 )
 
@@ -46,18 +46,20 @@ type cachingIndexClient struct {
 	cache    cache.Cache
 	validity time.Duration
 	limits   StoreLimits
+	logger   log.Logger
 }
 
-func newCachingIndexClient(client chunk.IndexClient, c cache.Cache, validity time.Duration, limits StoreLimits) chunk.IndexClient {
+func newCachingIndexClient(client chunk.IndexClient, c cache.Cache, validity time.Duration, limits StoreLimits, logger log.Logger) chunk.IndexClient {
 	if c == nil || cache.IsEmptyTieredCache(c) {
 		return client
 	}
 
 	return &cachingIndexClient{
 		IndexClient: client,
-		cache:       cache.NewSnappy(c),
+		cache:       cache.NewSnappy(c, logger),
 		validity:    validity,
 		limits:      limits,
+		logger:      logger,
 	}
 }
 
@@ -70,7 +72,7 @@ func (s *cachingIndexClient) QueryPages(ctx context.Context, queries []chunk.Ind
 	// We cache the entire row, so filter client side.
 	callback = chunk_util.QueryFilter(callback)
 
-	userID, err := user.ExtractOrgID(ctx)
+	userID, err := tenant.TenantID(ctx)
 	if err != nil {
 		return err
 	}
@@ -226,7 +228,7 @@ func (s *cachingIndexClient) cacheStore(ctx context.Context, keys []string, batc
 		hashed = append(hashed, cache.HashKey(keys[i]))
 		out, err := proto.Marshal(&batches[i])
 		if err != nil {
-			level.Warn(util.Logger).Log("msg", "error marshalling ReadBatch", "err", err)
+			level.Warn(s.logger).Log("msg", "error marshalling ReadBatch", "err", err)
 			cacheEncodeErrs.Inc()
 			return
 		}

@@ -12,6 +12,10 @@ import (
 	"testing"
 	"time"
 
+	cortex_util "github.com/cortexproject/cortex/pkg/util"
+
+	"github.com/stretchr/testify/assert"
+
 	"github.com/cespare/xxhash/v2"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
@@ -28,7 +32,7 @@ import (
 	"github.com/grafana/loki/pkg/logproto"
 	"github.com/grafana/loki/pkg/logql"
 	"github.com/grafana/loki/pkg/logql/marshal"
-	"github.com/grafana/loki/pkg/storage/stores/local"
+	"github.com/grafana/loki/pkg/storage/stores/shipper"
 	"github.com/grafana/loki/pkg/util/validation"
 )
 
@@ -186,26 +190,42 @@ func getLocalStore() Store {
 	if err != nil {
 		panic(err)
 	}
-	store, err := NewStore(Config{
+
+	storeConfig := Config{
 		Config: storage.Config{
 			BoltDBConfig: cortex_local.BoltDBConfig{Directory: "/tmp/benchmark/index"},
 			FSConfig:     cortex_local.FSConfig{Directory: "/tmp/benchmark/chunks"},
 		},
 		MaxChunkBatchSize: 10,
-	}, chunk.StoreConfig{}, chunk.SchemaConfig{
-		Configs: []chunk.PeriodConfig{
-			{
-				From:       chunk.DayTime{Time: start},
-				IndexType:  "boltdb",
-				ObjectType: "filesystem",
-				Schema:     "v9",
-				IndexTables: chunk.PeriodicTableConfig{
-					Prefix: "index_",
-					Period: time.Hour * 168,
+	}
+
+	schemaConfig := SchemaConfig{
+		chunk.SchemaConfig{
+			Configs: []chunk.PeriodConfig{
+				{
+					From:       chunk.DayTime{Time: start},
+					IndexType:  "boltdb",
+					ObjectType: "filesystem",
+					Schema:     "v9",
+					IndexTables: chunk.PeriodicTableConfig{
+						Prefix: "index_",
+						Period: time.Hour * 168,
+					},
 				},
 			},
 		},
-	}, limits, nil)
+	}
+
+	chunkStore, err := storage.NewStore(
+		storeConfig.Config,
+		chunk.StoreConfig{},
+		schemaConfig.SchemaConfig, limits, nil, nil, cortex_util.Logger)
+
+	if err != nil {
+		panic(err)
+	}
+
+	store, err := NewStore(storeConfig, schemaConfig, chunkStore, nil)
 	if err != nil {
 		panic(err)
 	}
@@ -380,6 +400,7 @@ func Test_store_SelectLogs(t *testing.T) {
 				cfg: Config{
 					MaxChunkBatchSize: 10,
 				},
+				chunkMetrics: NilMetrics,
 			}
 
 			ctx = user.InjectOrgID(context.Background(), "test-user")
@@ -589,6 +610,7 @@ func Test_store_SelectSample(t *testing.T) {
 				cfg: Config{
 					MaxChunkBatchSize: 10,
 				},
+				chunkMetrics: NilMetrics,
 			}
 
 			ctx = user.InjectOrgID(context.Background(), "test-user")
@@ -658,6 +680,7 @@ func Test_store_GetSeries(t *testing.T) {
 				cfg: Config{
 					MaxChunkBatchSize: tt.batchSize,
 				},
+				chunkMetrics: NilMetrics,
 			}
 			ctx = user.InjectOrgID(context.Background(), "test-user")
 			out, err := s.GetSeries(ctx, logql.SelectLogParams{QueryRequest: tt.req})
@@ -705,7 +728,7 @@ func Test_store_decodeReq_Matchers(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ms, _, _, _, err := decodeReq(logql.SelectLogParams{QueryRequest: tt.req})
+			ms, _, _, err := decodeReq(logql.SelectLogParams{QueryRequest: tt.req})
 			if err != nil {
 				t.Errorf("store.GetSeries() error = %v", err)
 				return
@@ -731,7 +754,7 @@ func TestStore_MultipleBoltDBShippersInConfig(t *testing.T) {
 	require.NoError(t, err)
 
 	// config for BoltDB Shipper
-	boltdbShipperConfig := local.ShipperConfig{}
+	boltdbShipperConfig := shipper.Config{}
 	flagext.DefaultValues(&boltdbShipperConfig)
 	boltdbShipperConfig.ActiveIndexDirectory = path.Join(tempDir, "index")
 	boltdbShipperConfig.SharedStoreType = "filesystem"
@@ -748,33 +771,47 @@ func TestStore_MultipleBoltDBShippersInConfig(t *testing.T) {
 		BoltDBShipperConfig: boltdbShipperConfig,
 	}
 
-	RegisterCustomIndexClients(config, nil)
-
-	store, err := NewStore(config, chunk.StoreConfig{}, chunk.SchemaConfig{
-		Configs: []chunk.PeriodConfig{
-			{
-				From:       chunk.DayTime{Time: timeToModelTime(firstStoreDate)},
-				IndexType:  "boltdb-shipper",
-				ObjectType: "filesystem",
-				Schema:     "v9",
-				IndexTables: chunk.PeriodicTableConfig{
-					Prefix: "index_",
-					Period: time.Hour * 168,
+	schemaConfig := SchemaConfig{
+		chunk.SchemaConfig{
+			Configs: []chunk.PeriodConfig{
+				{
+					From:       chunk.DayTime{Time: timeToModelTime(firstStoreDate)},
+					IndexType:  "boltdb-shipper",
+					ObjectType: "filesystem",
+					Schema:     "v9",
+					IndexTables: chunk.PeriodicTableConfig{
+						Prefix: "index_",
+						Period: time.Hour * 168,
+					},
 				},
-			},
-			{
-				From:       chunk.DayTime{Time: timeToModelTime(secondStoreDate)},
-				IndexType:  "boltdb-shipper",
-				ObjectType: "filesystem",
-				Schema:     "v11",
-				IndexTables: chunk.PeriodicTableConfig{
-					Prefix: "index_",
-					Period: time.Hour * 168,
+				{
+					From:       chunk.DayTime{Time: timeToModelTime(secondStoreDate)},
+					IndexType:  "boltdb-shipper",
+					ObjectType: "filesystem",
+					Schema:     "v11",
+					IndexTables: chunk.PeriodicTableConfig{
+						Prefix: "index_",
+						Period: time.Hour * 168,
+					},
+					RowShards: 2,
 				},
-				RowShards: 2,
 			},
 		},
-	}, limits, nil)
+	}
+
+	RegisterCustomIndexClients(&config, nil)
+
+	chunkStore, err := storage.NewStore(
+		config.Config,
+		chunk.StoreConfig{},
+		schemaConfig.SchemaConfig,
+		limits,
+		nil,
+		nil,
+		cortex_util.Logger,
+	)
+	require.NoError(t, err)
+	store, err := NewStore(config, schemaConfig, chunkStore, nil)
 	require.NoError(t, err)
 
 	// time ranges adding a chunk for each store and a chunk which overlaps both the stores
@@ -806,6 +843,25 @@ func TestStore_MultipleBoltDBShippersInConfig(t *testing.T) {
 
 		addedChunkIDs[chk.ExternalKey()] = struct{}{}
 	}
+
+	// recreate the store because boltdb-shipper now runs queriers on snapshots which are created every 1 min and during startup.
+	store.Stop()
+
+	chunkStore, err = storage.NewStore(
+		config.Config,
+		chunk.StoreConfig{},
+		schemaConfig.SchemaConfig,
+		limits,
+		nil,
+		nil,
+		cortex_util.Logger,
+	)
+	require.NoError(t, err)
+
+	store, err = NewStore(config, schemaConfig, chunkStore, nil)
+	require.NoError(t, err)
+
+	defer store.Stop()
 
 	// get all the chunks from both the stores
 	chunks, err := store.Get(ctx, "fake", timeToModelTime(firstStoreDate), timeToModelTime(secondStoreDate.Add(24*time.Hour)), newMatchers(fooLabelsWithName)...)
@@ -857,4 +913,166 @@ func buildTestStreams(labels string, tr timeRange) logproto.Stream {
 
 func timeToModelTime(t time.Time) model.Time {
 	return model.TimeFromUnixNano(t.UnixNano())
+}
+
+func TestActiveIndexType(t *testing.T) {
+	var cfg SchemaConfig
+
+	// just one PeriodConfig in the past
+	cfg.Configs = []chunk.PeriodConfig{{
+		From:      chunk.DayTime{Time: model.Now().Add(-24 * time.Hour)},
+		IndexType: "first",
+	}}
+
+	assert.Equal(t, 0, ActivePeriodConfig(cfg.Configs))
+
+	// add a newer PeriodConfig in the past which should be considered
+	cfg.Configs = append(cfg.Configs, chunk.PeriodConfig{
+		From:      chunk.DayTime{Time: model.Now().Add(-12 * time.Hour)},
+		IndexType: "second",
+	})
+	assert.Equal(t, 1, ActivePeriodConfig(cfg.Configs))
+
+	// add a newer PeriodConfig in the future which should not be considered
+	cfg.Configs = append(cfg.Configs, chunk.PeriodConfig{
+		From:      chunk.DayTime{Time: model.Now().Add(time.Hour)},
+		IndexType: "third",
+	})
+	assert.Equal(t, 1, ActivePeriodConfig(cfg.Configs))
+}
+
+func TestUsingBoltdbShipper(t *testing.T) {
+	var cfg SchemaConfig
+
+	// just one PeriodConfig in the past using boltdb-shipper
+	cfg.Configs = []chunk.PeriodConfig{{
+		From:      chunk.DayTime{Time: model.Now().Add(-24 * time.Hour)},
+		IndexType: "boltdb-shipper",
+	}}
+	assert.Equal(t, true, UsingBoltdbShipper(cfg.Configs))
+
+	// just one PeriodConfig in the past not using boltdb-shipper
+	cfg.Configs[0].IndexType = "boltdb"
+	assert.Equal(t, false, UsingBoltdbShipper(cfg.Configs))
+
+	// add a newer PeriodConfig in the future using boltdb-shipper
+	cfg.Configs = append(cfg.Configs, chunk.PeriodConfig{
+		From:      chunk.DayTime{Time: model.Now().Add(time.Hour)},
+		IndexType: "boltdb-shipper",
+	})
+	assert.Equal(t, true, UsingBoltdbShipper(cfg.Configs))
+}
+
+func TestSchemaConfig_Validate(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		configs []chunk.PeriodConfig
+		err     error
+	}{
+		{
+			name:    "empty",
+			configs: []chunk.PeriodConfig{},
+			err:     errZeroLengthConfig,
+		},
+		{
+			name: "NOT using boltdb-shipper",
+			configs: []chunk.PeriodConfig{{
+				From:      chunk.DayTime{Time: model.Now().Add(-24 * time.Hour)},
+				IndexType: "boltdb",
+				Schema:    "v9",
+				IndexTables: chunk.PeriodicTableConfig{
+					Period: 7 * 24 * time.Hour,
+				},
+			}},
+		},
+		{
+			name: "current config boltdb-shipper with 7 days periodic config, without future index type changes",
+			configs: []chunk.PeriodConfig{{
+				From:      chunk.DayTime{Time: model.Now().Add(-24 * time.Hour)},
+				IndexType: "boltdb-shipper",
+				Schema:    "v9",
+				IndexTables: chunk.PeriodicTableConfig{
+					Period: 7 * 24 * time.Hour,
+				},
+			}},
+			err: errCurrentBoltdbShipperNon24Hours,
+		},
+		{
+			name: "current config boltdb-shipper with 1 day periodic config, without future index type changes",
+			configs: []chunk.PeriodConfig{{
+				From:      chunk.DayTime{Time: model.Now().Add(-24 * time.Hour)},
+				IndexType: "boltdb-shipper",
+				Schema:    "v9",
+				IndexTables: chunk.PeriodicTableConfig{
+					Period: 24 * time.Hour,
+				},
+			}},
+		},
+		{
+			name: "current config boltdb-shipper with 7 days periodic config, upcoming config NOT boltdb-shipper",
+			configs: []chunk.PeriodConfig{{
+				From:      chunk.DayTime{Time: model.Now().Add(-24 * time.Hour)},
+				IndexType: "boltdb-shipper",
+				Schema:    "v9",
+				IndexTables: chunk.PeriodicTableConfig{
+					Period: 24 * time.Hour,
+				},
+			}, {
+				From:      chunk.DayTime{Time: model.Now().Add(time.Hour)},
+				IndexType: "boltdb",
+				Schema:    "v9",
+				IndexTables: chunk.PeriodicTableConfig{
+					Period: 7 * 24 * time.Hour,
+				},
+			}},
+		},
+		{
+			name: "current and upcoming config boltdb-shipper with 7 days periodic config",
+			configs: []chunk.PeriodConfig{{
+				From:      chunk.DayTime{Time: model.Now().Add(-24 * time.Hour)},
+				IndexType: "boltdb-shipper",
+				Schema:    "v9",
+				IndexTables: chunk.PeriodicTableConfig{
+					Period: 24 * time.Hour,
+				},
+			}, {
+				From:      chunk.DayTime{Time: model.Now().Add(time.Hour)},
+				IndexType: "boltdb-shipper",
+				Schema:    "v9",
+				IndexTables: chunk.PeriodicTableConfig{
+					Period: 7 * 24 * time.Hour,
+				},
+			}},
+			err: errUpcomingBoltdbShipperNon24Hours,
+		},
+		{
+			name: "current config NOT boltdb-shipper, upcoming config boltdb-shipper with 7 days periodic config",
+			configs: []chunk.PeriodConfig{{
+				From:      chunk.DayTime{Time: model.Now().Add(-24 * time.Hour)},
+				IndexType: "boltdb",
+				Schema:    "v9",
+				IndexTables: chunk.PeriodicTableConfig{
+					Period: 24 * time.Hour,
+				},
+			}, {
+				From:      chunk.DayTime{Time: model.Now().Add(time.Hour)},
+				IndexType: "boltdb-shipper",
+				Schema:    "v9",
+				IndexTables: chunk.PeriodicTableConfig{
+					Period: 7 * 24 * time.Hour,
+				},
+			}},
+			err: errUpcomingBoltdbShipperNon24Hours,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := SchemaConfig{chunk.SchemaConfig{Configs: tc.configs}}
+			err := cfg.Validate()
+			if tc.err == nil {
+				require.NoError(t, err)
+			} else {
+				require.EqualError(t, err, tc.err.Error())
+			}
+		})
+	}
 }

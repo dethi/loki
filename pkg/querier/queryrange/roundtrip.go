@@ -9,7 +9,6 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/chunk"
 	"github.com/cortexproject/cortex/pkg/chunk/cache"
-	"github.com/cortexproject/cortex/pkg/querier/frontend"
 	"github.com/cortexproject/cortex/pkg/querier/queryrange"
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -45,7 +44,7 @@ func NewTripperware(
 	schema chunk.SchemaConfig,
 	minShardingLookback time.Duration,
 	registerer prometheus.Registerer,
-) (frontend.Tripperware, Stopper, error) {
+) (queryrange.Tripperware, Stopper, error) {
 	// Ensure that QuerySplitDuration uses configuration defaults.
 	// This avoids divide by zero errors when determining cache keys where user specific overrides don't exist.
 	limits = WithDefaultLimits(limits, cfg.Config)
@@ -55,10 +54,14 @@ func NewTripperware(
 	shardingMetrics := logql.NewShardingMetrics(registerer)
 	splitByMetrics := NewSplitByMetrics(registerer)
 
-	metricsTripperware, cache, err := NewMetricTripperware(cfg, log, limits, schema, minShardingLookback, lokiCodec, PrometheusExtractor{}, instrumentMetrics, retryMetrics, shardingMetrics, splitByMetrics)
+	metricsTripperware, cache, err := NewMetricTripperware(cfg, log, limits, schema, minShardingLookback, lokiCodec,
+		PrometheusExtractor{}, instrumentMetrics, retryMetrics, shardingMetrics, splitByMetrics, registerer)
 	if err != nil {
 		return nil, nil, err
 	}
+
+	// NOTE: When we would start caching response from non-metric queries we would have to consider cache gen headers as well in
+	// MergeResponse implementation for Loki codecs same as it is done in Cortex at https://github.com/cortexproject/cortex/blob/21bad57b346c730d684d6d0205efef133422ab28/pkg/querier/queryrange/query_range.go#L170
 	logFilterTripperware, err := NewLogFilterTripperware(cfg, log, limits, schema, minShardingLookback, lokiCodec, instrumentMetrics, retryMetrics, shardingMetrics, splitByMetrics)
 	if err != nil {
 		return nil, nil, err
@@ -69,27 +72,34 @@ func NewTripperware(
 		return nil, nil, err
 	}
 
+	labelsTripperware, err := NewLabelsTripperware(cfg, log, limits, lokiCodec, instrumentMetrics, retryMetrics, splitByMetrics)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	return func(next http.RoundTripper) http.RoundTripper {
 		metricRT := metricsTripperware(next)
 		logFilterRT := logFilterTripperware(next)
 		seriesRT := seriesTripperware(next)
-		return newRoundTripper(next, logFilterRT, metricRT, seriesRT, limits)
+		labelsRT := labelsTripperware(next)
+		return newRoundTripper(next, logFilterRT, metricRT, seriesRT, labelsRT, limits)
 	}, cache, nil
 }
 
 type roundTripper struct {
-	next, log, metric, series http.RoundTripper
+	next, log, metric, series, labels http.RoundTripper
 
 	limits Limits
 }
 
 // newRoundTripper creates a new queryrange roundtripper
-func newRoundTripper(next, log, metric, series http.RoundTripper, limits Limits) roundTripper {
+func newRoundTripper(next, log, metric, series, labels http.RoundTripper, limits Limits) roundTripper {
 	return roundTripper{
 		log:    log,
 		limits: limits,
 		metric: metric,
 		series: series,
+		labels: labels,
 		next:   next,
 	}
 }
@@ -100,7 +110,7 @@ func (r roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
 	}
 
-	switch op := getOperation(req); op {
+	switch op := getOperation(req.URL.Path); op {
 	case QueryRangeOp:
 		rangeQuery, err := loghttp.ParseRangeQuery(req)
 		if err != nil {
@@ -114,14 +124,14 @@ func (r roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 		case logql.SampleExpr:
 			return r.metric.RoundTrip(req)
 		case logql.LogSelectorExpr:
-			filter, err := transformRegexQuery(req, e).Filter()
+			expr, err := transformRegexQuery(req, e)
 			if err != nil {
 				return nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
 			}
 			if err := validateLimits(req, rangeQuery.Limit, r.limits); err != nil {
 				return nil, err
 			}
-			if filter == nil {
+			if !expr.HasFilter() {
 				return r.next.RoundTrip(req)
 			}
 			return r.log.RoundTrip(req)
@@ -135,24 +145,34 @@ func (r roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 			return nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
 		}
 		return r.series.RoundTrip(req)
+	case LabelNamesOp:
+		_, err := loghttp.ParseLabelQuery(req)
+		if err != nil {
+			return nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
+		}
+		return r.labels.RoundTrip(req)
 	default:
 		return r.next.RoundTrip(req)
 	}
 }
 
 // transformRegexQuery backport the old regexp params into the v1 query format
-func transformRegexQuery(req *http.Request, expr logql.LogSelectorExpr) logql.LogSelectorExpr {
+func transformRegexQuery(req *http.Request, expr logql.LogSelectorExpr) (logql.LogSelectorExpr, error) {
 	regexp := req.Form.Get("regexp")
 	if regexp != "" {
-		expr = logql.NewFilterExpr(expr, labels.MatchRegexp, regexp)
+		filterExpr, err := logql.AddFilterExpr(expr, labels.MatchRegexp, regexp)
+		if err != nil {
+			return nil, err
+		}
 		params := req.URL.Query()
-		params.Set("query", expr.String())
+		params.Set("query", filterExpr.String())
 		req.URL.RawQuery = params.Encode()
 		// force the form and query to be parsed again.
 		req.Form = nil
 		req.PostForm = nil
+		return filterExpr, nil
 	}
-	return expr
+	return expr, nil
 }
 
 // validates log entries limits
@@ -173,14 +193,18 @@ func validateLimits(req *http.Request, reqLimit uint32, limits Limits) error {
 const (
 	QueryRangeOp = "query_range"
 	SeriesOp     = "series"
+	LabelNamesOp = "labels"
 )
 
-func getOperation(req *http.Request) string {
-	if strings.HasSuffix(req.URL.Path, "/query_range") || strings.HasSuffix(req.URL.Path, "/prom/query") {
+func getOperation(path string) string {
+	switch {
+	case strings.HasSuffix(path, "/query_range") || strings.HasSuffix(path, "/prom/query"):
 		return QueryRangeOp
-	} else if strings.HasSuffix(req.URL.Path, "/series") {
+	case strings.HasSuffix(path, "/series"):
 		return SeriesOp
-	} else {
+	case strings.HasSuffix(path, "/labels") || strings.HasSuffix(path, "/label"):
+		return LabelNamesOp
+	default:
 		return ""
 	}
 }
@@ -197,8 +221,8 @@ func NewLogFilterTripperware(
 	retryMiddlewareMetrics *queryrange.RetryMiddlewareMetrics,
 	shardingMetrics *logql.ShardingMetrics,
 	splitByMetrics *SplitByMetrics,
-) (frontend.Tripperware, error) {
-	queryRangeMiddleware := []queryrange.Middleware{StatsCollectorMiddleware(), queryrange.LimitsMiddleware(limits)}
+) (queryrange.Tripperware, error) {
+	queryRangeMiddleware := []queryrange.Middleware{StatsCollectorMiddleware(), queryrange.NewLimitsMiddleware(limits)}
 	if cfg.SplitQueriesByInterval != 0 {
 		queryRangeMiddleware = append(queryRangeMiddleware, queryrange.InstrumentMiddleware("split_by_interval", instrumentMetrics), SplitByIntervalMiddleware(limits, codec, splitByMetrics))
 	}
@@ -214,6 +238,7 @@ func NewLogFilterTripperware(
 				minShardingLookback,
 				instrumentMetrics, // instrumentation is included in the sharding middleware
 				shardingMetrics,
+				limits,
 			),
 		)
 	}
@@ -239,10 +264,45 @@ func NewSeriesTripperware(
 	instrumentMetrics *queryrange.InstrumentMiddlewareMetrics,
 	retryMiddlewareMetrics *queryrange.RetryMiddlewareMetrics,
 	splitByMetrics *SplitByMetrics,
-) (frontend.Tripperware, error) {
+) (queryrange.Tripperware, error) {
 	queryRangeMiddleware := []queryrange.Middleware{}
 	if cfg.SplitQueriesByInterval != 0 {
-		queryRangeMiddleware = append(queryRangeMiddleware, queryrange.InstrumentMiddleware("split_by_interval", instrumentMetrics), SplitByIntervalMiddleware(limits, codec, splitByMetrics))
+		queryRangeMiddleware = append(queryRangeMiddleware,
+			queryrange.InstrumentMiddleware("split_by_interval", instrumentMetrics),
+			// The Series API needs to pull one chunk per series to extract the label set, which is much cheaper than iterating through all matching chunks.
+			SplitByIntervalMiddleware(WithSplitByLimits(limits, cfg.SplitQueriesByInterval), codec, splitByMetrics),
+		)
+	}
+	if cfg.MaxRetries > 0 {
+		queryRangeMiddleware = append(queryRangeMiddleware, queryrange.InstrumentMiddleware("retry", instrumentMetrics), queryrange.NewRetryMiddleware(log, cfg.MaxRetries, retryMiddlewareMetrics))
+	}
+
+	return func(next http.RoundTripper) http.RoundTripper {
+		if len(queryRangeMiddleware) > 0 {
+			return queryrange.NewRoundTripper(next, codec, queryRangeMiddleware...)
+		}
+		return next
+	}, nil
+}
+
+// NewLabelsTripperware creates a new frontend tripperware responsible for handling labels requests.
+func NewLabelsTripperware(
+	cfg Config,
+	log log.Logger,
+	limits Limits,
+	codec queryrange.Codec,
+	instrumentMetrics *queryrange.InstrumentMiddlewareMetrics,
+	retryMiddlewareMetrics *queryrange.RetryMiddlewareMetrics,
+	splitByMetrics *SplitByMetrics,
+) (queryrange.Tripperware, error) {
+	queryRangeMiddleware := []queryrange.Middleware{}
+	if cfg.SplitQueriesByInterval != 0 {
+		queryRangeMiddleware = append(queryRangeMiddleware,
+			queryrange.InstrumentMiddleware("split_by_interval", instrumentMetrics),
+			// Force a 24 hours split by for labels API, this will be more efficient with our static daily bucket storage.
+			// This is because the labels API is an index-only operation.
+			SplitByIntervalMiddleware(WithSplitByLimits(limits, 24*time.Hour), codec, splitByMetrics),
+		)
 	}
 	if cfg.MaxRetries > 0 {
 		queryRangeMiddleware = append(queryRangeMiddleware, queryrange.InstrumentMiddleware("retry", instrumentMetrics), queryrange.NewRetryMiddleware(log, cfg.MaxRetries, retryMiddlewareMetrics))
@@ -269,8 +329,9 @@ func NewMetricTripperware(
 	retryMiddlewareMetrics *queryrange.RetryMiddlewareMetrics,
 	shardingMetrics *logql.ShardingMetrics,
 	splitByMetrics *SplitByMetrics,
-) (frontend.Tripperware, Stopper, error) {
-	queryRangeMiddleware := []queryrange.Middleware{StatsCollectorMiddleware(), queryrange.LimitsMiddleware(limits)}
+	registerer prometheus.Registerer,
+) (queryrange.Tripperware, Stopper, error) {
+	queryRangeMiddleware := []queryrange.Middleware{StatsCollectorMiddleware(), queryrange.NewLimitsMiddleware(limits)}
 	if cfg.AlignQueriesWithStep {
 		queryRangeMiddleware = append(
 			queryRangeMiddleware,
@@ -300,6 +361,10 @@ func NewMetricTripperware(
 			codec,
 			extractor,
 			nil,
+			func(r queryrange.Request) bool {
+				return !r.GetCachingOptions().Disabled
+			},
+			registerer,
 		)
 		if err != nil {
 			return nil, nil, err
@@ -323,6 +388,7 @@ func NewMetricTripperware(
 				minShardingLookback,
 				instrumentMetrics, // instrumentation is included in the sharding middleware
 				shardingMetrics,
+				limits,
 			),
 		)
 	}
@@ -339,7 +405,7 @@ func NewMetricTripperware(
 		// Finally, if the user selected any query range middleware, stitch it in.
 		if len(queryRangeMiddleware) > 0 {
 			rt := queryrange.NewRoundTripper(next, codec, queryRangeMiddleware...)
-			return frontend.RoundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return queryrange.RoundTripFunc(func(r *http.Request) (*http.Response, error) {
 				if !strings.HasSuffix(r.URL.Path, "/query_range") {
 					return next.RoundTrip(r)
 				}

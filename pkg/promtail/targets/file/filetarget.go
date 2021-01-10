@@ -17,6 +17,7 @@ import (
 
 	"github.com/grafana/loki/pkg/helpers"
 	"github.com/grafana/loki/pkg/promtail/api"
+	"github.com/grafana/loki/pkg/promtail/client"
 	"github.com/grafana/loki/pkg/promtail/positions"
 	"github.com/grafana/loki/pkg/promtail/targets/target"
 )
@@ -60,13 +61,20 @@ type Config struct {
 	Stdin      bool          `yaml:"stdin"`
 }
 
+// RegisterFlags with prefix registers flags where every name is prefixed by
+// prefix. If prefix is a non-empty string, prefix should end with a period.
+func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
+	f.DurationVar(&cfg.SyncPeriod, prefix+"target.sync-period", 10*time.Second, "Period to resync directories being watched and files being tailed.")
+	f.BoolVar(&cfg.Stdin, prefix+"stdin", false, "Set to true to pipe logs to promtail.")
+}
+
 // RegisterFlags register flags.
 func (cfg *Config) RegisterFlags(flags *flag.FlagSet) {
-	flags.DurationVar(&cfg.SyncPeriod, "target.sync-period", 10*time.Second, "Period to resync directories being watched and files being tailed.")
-	flags.BoolVar(&cfg.Stdin, "stdin", false, "Set to true to pipe logs to promtail.")
+	cfg.RegisterFlagsWithPrefix("", flags)
 }
 
 // FileTarget describes a particular set of logs.
+// nolint:golint
 type FileTarget struct {
 	logger log.Logger
 
@@ -126,6 +134,7 @@ func (t *FileTarget) Ready() bool {
 func (t *FileTarget) Stop() {
 	close(t.quit)
 	<-t.done
+	t.handler.Stop()
 }
 
 // Type implements a Target
@@ -156,10 +165,9 @@ func (t *FileTarget) run() {
 	defer func() {
 		helpers.LogError("closing watcher", t.watcher.Close)
 		for _, v := range t.tails {
-			helpers.LogError("updating tailer last position", v.markPositionAndSize)
-			helpers.LogError("stopping tailer", v.stop)
+			v.stop()
 		}
-		level.Debug(t.logger).Log("msg", "watcher closed, tailer stopped, positions saved")
+		level.Info(t.logger).Log("msg", "filetarget: watcher closed, tailer stopped, positions saved", "path", t.path)
 		close(t.done)
 	}()
 
@@ -239,12 +247,16 @@ func (t *FileTarget) sync() error {
 	// fsnotify.Watcher doesn't allow us to see what is currently being watched so we have to track it ourselves.
 	t.watches = dirs
 
+	// Check if any running tailers have stopped because of errors and remove them from the running list
+	// (They will be restarted in startTailing)
+	t.pruneStoppedTailers()
+
 	// Start tailing all of the matched files if not already doing so.
 	t.startTailing(matches)
 
 	// Stop tailing any files which no longer exist
 	toStopTailing := toStopTailing(matches, t.tails)
-	t.stopTailing(toStopTailing)
+	t.stopTailingAndRemovePosition(toStopTailing)
 
 	return nil
 }
@@ -298,13 +310,32 @@ func (t *FileTarget) startTailing(ps []string) {
 	}
 }
 
-func (t *FileTarget) stopTailing(ps []string) {
+// stopTailingAndRemovePosition will stop the tailer and remove the positions entry.
+// Call this when a file no longer exists and you want to remove all traces of it.
+func (t *FileTarget) stopTailingAndRemovePosition(ps []string) {
 	for _, p := range ps {
 		if tailer, ok := t.tails[p]; ok {
-			helpers.LogError("stopping tailer", tailer.stop)
-			tailer.cleanup()
+			tailer.stop()
+			t.positions.Remove(tailer.path)
 			delete(t.tails, p)
 		}
+		if h, ok := t.handler.(api.InstrumentedEntryHandler); ok {
+			h.UnregisterLatencyMetric(model.LabelSet{model.LabelName(client.LatencyLabel): model.LabelValue(p)})
+		}
+	}
+}
+
+// pruneStoppedTailers removes any tailers which have stopped running from
+// the list of active tailers. This allows them to be restarted if there were errors.
+func (t *FileTarget) pruneStoppedTailers() {
+	toRemove := make([]string, 0, len(t.tails))
+	for k, t := range t.tails {
+		if !t.isRunning() {
+			toRemove = append(toRemove, k)
+		}
+	}
+	for _, tr := range toRemove {
+		delete(t.tails, tr)
 	}
 }
 
